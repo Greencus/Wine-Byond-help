@@ -22,6 +22,7 @@
 #
 # Options:
 #   --prefix DIR            Wine prefix (default: $HOME/Games/byond)
+#   --fresh                 Start from a new prefix; back up old prefix and clear cache
 #   --wine PATH             wine binary  (default: /usr/bin/wine, must be >=10.8)
 #   --byond-version VER     BYOND build  (default: 516.1667)
 #   --no-dxvk               Do not install DXVK / do not set DXVK overrides
@@ -77,6 +78,7 @@ SYSTEM_INSTALL="${SYSTEM_INSTALL:-1}"   # 1 => /usr/local,/usr/share,/etc ; 0 =>
 ASSUME_YES="${ASSUME_YES:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 LAUNCHER_ONLY="${LAUNCHER_ONLY:-0}"
+FRESH_INSTALL="${FRESH_INSTALL:-0}"
 CACHE_DIR="${CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/byond-installer}"
 
 # ---------------------------------------------------------------------------
@@ -125,6 +127,70 @@ place() { # place <src> <dest-abs> <mode> <0|1 use_sudo>
   fi
 }
 
+fresh_prefix() {
+  [ "$FRESH_INSTALL" = "1" ] || return 0
+  [ "$LAUNCHER_ONLY" != "1" ] || die "--fresh cannot be used with --launcher-only"
+
+  need readlink
+  need date
+  local resolved_prefix resolved_home resolved_cache script_dir backup_path backup_stamp
+  resolved_prefix="$(readlink -m -- "$PREFIX")" || die "could not resolve prefix path"
+  resolved_home="$(readlink -m -- "$HOME")" || die "could not resolve home path"
+  resolved_cache="$(readlink -m -- "$CACHE_DIR")" || die "could not resolve cache path"
+  script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)" || die "could not resolve installer directory"
+
+  if [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; then
+    [ -d "$PREFIX" ] || die "existing prefix is not a directory: $PREFIX"
+    [ "$resolved_prefix" != "/" ] || die "refusing to fresh-install the root directory"
+    [ "$resolved_prefix" != "$resolved_home" ] || die "refusing to fresh-install the home directory"
+    case "$resolved_home/" in
+      "$resolved_prefix/"*) die "refusing to move a directory containing the home directory" ;;
+    esac
+    case "$script_dir/" in
+      "$resolved_prefix/"*) die "refusing to move a directory containing the installer" ;;
+    esac
+    case "$resolved_prefix/" in
+      "$script_dir/"*) die "refusing to move a prefix inside the installer directory" ;;
+    esac
+  else
+    log "fresh install requested; no existing prefix to back up"
+  fi
+
+  [ "$resolved_cache" != "/" ] || die "refusing to clear the root directory as installer cache"
+  [ "$resolved_cache" != "$resolved_home" ] || die "refusing to clear the home directory as installer cache"
+  case "$resolved_home/" in
+    "$resolved_cache/"*) die "refusing to clear a cache directory containing the home directory" ;;
+  esac
+  case "$resolved_prefix/" in
+    "$resolved_cache/"*) die "refusing to clear a cache directory containing the prefix" ;;
+  esac
+  case "$resolved_cache/" in
+    "$resolved_prefix/"*) die "refusing to clear a cache directory inside the prefix" ;;
+  esac
+  case "$script_dir/" in
+    "$resolved_cache/"*) die "refusing to clear a cache directory containing the installer" ;;
+  esac
+  case "$resolved_cache/" in
+    "$script_dir/"*) die "refusing to clear a cache directory inside the installer directory" ;;
+  esac
+
+  if [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; then
+    backup_stamp="$(date '+%Y%m%d-%H%M%S')" || die "could not create backup timestamp"
+    backup_path="${PREFIX}.backup-${backup_stamp}"
+    if [ -e "$backup_path" ] || [ -L "$backup_path" ]; then
+      backup_path="${backup_path}-$$"
+    fi
+    [ ! -e "$backup_path" ] && [ ! -L "$backup_path" ] \
+      || die "prefix backup path already exists: $backup_path"
+    mv -T -- "$PREFIX" "$backup_path" || die "could not back up existing prefix to $backup_path"
+    log "existing prefix moved to backup: $backup_path"
+  fi
+
+  log "clearing installer cache: $resolved_cache"
+  rm -rf -- "$resolved_cache" || die "could not clear installer cache: $resolved_cache"
+  mkdir -p -- "$resolved_cache" || die "could not recreate installer cache: $resolved_cache"
+}
+
 # ---------------------------------------------------------------------------
 # Flags
 # ---------------------------------------------------------------------------
@@ -132,6 +198,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help)            usage ;;
     --prefix)             PREFIX="$2"; shift 2 ;;
+    --fresh)              FRESH_INSTALL=1; shift ;;
     --wine)               WINE_BIN="$2"; shift 2 ;;
     --byond-version)      BYOND_VERSION="$2"; shift 2 ;;
     --byond-url)          BYOND_URL="$2"; shift 2 ;;
@@ -155,7 +222,11 @@ while [ $# -gt 0 ]; do
 done
 
 export PREFIX WINE_BIN
-PREFIX="${PREFIX%/}"
+if [ "$PREFIX" != "/" ]; then PREFIX="${PREFIX%/}"; fi
+[ -n "$PREFIX" ] || die "prefix cannot be empty"
+[ "$PREFIX" != "/" ] || die "prefix cannot be /"
+[ "$FRESH_INSTALL" != "1" ] || [ "$LAUNCHER_ONLY" != "1" ] \
+  || die "--fresh cannot be used with --launcher-only"
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -166,6 +237,7 @@ log "  prefix      : $PREFIX"
 log "  BYOND       : $BYOND_VERSION"
 log "  DXVK        : $DXVK_ENABLED (v$DXVK_VERSION)"
 log "  repo base   : $REPO_BASE"
+log "  fresh       : $FRESH_INSTALL"
 
 need "$WINE_BIN"
 need winetricks; need curl; need unzip; need tar; need sha256sum
@@ -321,6 +393,7 @@ if [ "$LAUNCHER_ONLY" != "1" ]; then
 # ---------------------------------------------------------------------------
 log "creating/updating win64 prefix"
 export WINEPREFIX="$PREFIX" WINEARCH=win64
+fresh_prefix
 mkdir -p "$(dirname "$PREFIX")"
 "$WINE_BIN" wineboot -u >/dev/null 2>&1 || warn "wineboot returned non-zero (often harmless)"
 [ -d "$PREFIX/drive_c" ] || die "prefix was not created at $PREFIX"
