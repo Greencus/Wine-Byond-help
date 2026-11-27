@@ -23,6 +23,7 @@
 # Options:
 #   --prefix DIR            Wine prefix (default: $HOME/Games/byond)
 #   --fresh                 Start from a new prefix; back up old prefix and clear cache
+#   --remove                Remove the prefix, its backups, cache, and BYOND launcher files
 #   --wine PATH             wine binary  (default: /usr/bin/wine, must be >=10.8)
 #   --byond-version VER     BYOND build  (default: 516.1667)
 #   --no-dxvk               Do not install DXVK / do not set DXVK overrides
@@ -79,6 +80,7 @@ ASSUME_YES="${ASSUME_YES:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 LAUNCHER_ONLY="${LAUNCHER_ONLY:-0}"
 FRESH_INSTALL="${FRESH_INSTALL:-0}"
+REMOVE_INSTALL="${REMOVE_INSTALL:-0}"
 CACHE_DIR="${CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/byond-installer}"
 
 # ---------------------------------------------------------------------------
@@ -191,6 +193,234 @@ fresh_prefix() {
   mkdir -p -- "$resolved_cache" || die "could not recreate installer cache: $resolved_cache"
 }
 
+remove_file() { # remove_file <path> [system]
+  local path="$1" system="${2:-0}"
+  [ -e "$path" ] || [ -L "$path" ] || return 0
+  if [ "$system" = "1" ] && [ "$EUID" -ne 0 ]; then
+    need sudo
+    sudo rm -f -- "$path" || die "could not remove $path"
+  else
+    rm -f -- "$path" || die "could not remove $path"
+  fi
+  log "removed $path"
+}
+
+remove_empty_dir() { # remove_empty_dir <path> [system]
+  local path="$1" system="${2:-0}" contents
+  [ -d "$path" ] && [ ! -L "$path" ] || return 0
+  if [ "$system" = "1" ]; then
+    if [ "$EUID" -eq 0 ]; then
+      rmdir --ignore-fail-on-non-empty -- "$path" || die "could not remove empty directory: $path"
+    else
+      need sudo
+      sudo rmdir --ignore-fail-on-non-empty -- "$path" \
+        || die "could not remove empty directory: $path"
+    fi
+    return 0
+  fi
+  contents="$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)" \
+    || die "could not inspect directory: $path"
+  [ -z "$contents" ] || return 0
+  rmdir -- "$path" || die "could not remove empty directory: $path"
+}
+
+refuse_system_tree() { # refuse_system_tree <resolved-path> <label>
+  local path="$1" label="$2" protected
+  for protected in /usr /etc /var /bin /sbin /lib /lib64 /boot /dev /proc /sys /run; do
+    [ "$path" != "$protected" ] \
+      || die "refusing to remove $protected as $label"
+    case "$protected/" in
+      "$path/"*) die "refusing to remove a path containing protected directory $protected" ;;
+    esac
+    case "$path/" in
+      "$protected/"*) die "refusing to remove $label inside protected directory $protected" ;;
+    esac
+  done
+  for protected in /tmp /home /root /mnt /media /opt /srv; do
+    [ "$path" != "$protected" ] \
+      || die "refusing to remove $protected as $label"
+    case "$protected/" in
+      "$path/"*) die "refusing to remove a path containing protected directory $protected" ;;
+    esac
+  done
+}
+
+remove_mime_association() {
+  local mimeapps="${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list" tmp
+  [ -f "$mimeapps" ] || return 0
+  [ ! -L "$mimeapps" ] || die "refusing to replace symlinked MIME configuration: $mimeapps"
+
+  tmp="$(mktemp "${mimeapps}.byond-remove.XXXXXX")" \
+    || die "could not create temporary MIME configuration"
+  if ! awk '
+    function remove_byond(value, count, ids, i, result, found) {
+      count = split(value, ids, ";")
+      for (i = 1; i <= count; i++) {
+        if (ids[i] == "byond.desktop" || ids[i] == "byond-url-handler.desktop")
+          found = 1
+      }
+      if (!found)
+        return value
+      for (i = 1; i <= count; i++) {
+        if (ids[i] != "" && ids[i] != "byond.desktop" && ids[i] != "byond-url-handler.desktop")
+          result = result ids[i] ";"
+      }
+      return result
+    }
+    /^\[/ { section = $0; print; next }
+    section == "[Default Applications]" || section == "[Added Associations]" {
+      separator = index($0, "=")
+      if (separator && substr($0, 1, separator - 1) == "x-scheme-handler/byond") {
+        key = substr($0, 1, separator - 1)
+        value = remove_byond(substr($0, separator + 1))
+        if (value != "")
+          print key "=" value
+        next
+      }
+    }
+    { print }
+  ' "$mimeapps" > "$tmp"; then
+    rm -f -- "$tmp"
+    die "could not update MIME configuration: $mimeapps"
+  fi
+
+  if cmp -s -- "$mimeapps" "$tmp"; then
+    rm -f -- "$tmp"
+  else
+    chmod --reference="$mimeapps" "$tmp" || {
+      rm -f -- "$tmp"
+      die "could not preserve permissions for $mimeapps"
+    }
+    mv -f -- "$tmp" "$mimeapps" || {
+      rm -f -- "$tmp"
+      die "could not update MIME configuration: $mimeapps"
+    }
+    log "removed BYOND URL association from $mimeapps"
+  fi
+}
+
+remove_installation() {
+  [ "$FRESH_INSTALL" != "1" ] || die "--remove cannot be combined with --fresh"
+  [ "$DRY_RUN" != "1" ] || die "--remove cannot be combined with --dry-run"
+  [ "$LAUNCHER_ONLY" != "1" ] || die "--remove cannot be combined with --launcher-only"
+
+  need readlink
+  need awk
+  need cmp
+  need mktemp
+  need find
+  local resolved_prefix resolved_cache resolved_home script_dir
+  local user_config user_launcher user_desktop apps_user identity_file mimeapps
+  local backup backup_suffix
+  resolved_prefix="$(readlink -m -- "$PREFIX")" || die "could not resolve prefix path"
+  resolved_cache="$(readlink -m -- "$CACHE_DIR")" || die "could not resolve cache path"
+  resolved_home="$(readlink -m -- "$HOME")" || die "could not resolve home path"
+  script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)" || die "could not resolve installer directory"
+
+  [ "$resolved_prefix" != "/" ] || die "refusing to remove the root directory as prefix"
+  [ "$resolved_prefix" != "$resolved_home" ] || die "refusing to remove the home directory as prefix"
+  refuse_system_tree "$resolved_prefix" prefix
+  case "$resolved_home/" in
+    "$resolved_prefix/"*) die "refusing to remove a prefix containing the home directory" ;;
+  esac
+  case "$script_dir/" in
+    "$resolved_prefix/"*) die "refusing to remove a prefix containing the installer" ;;
+  esac
+  case "$resolved_prefix/" in
+    "$script_dir/"*) die "refusing to remove a prefix inside the installer directory" ;;
+  esac
+  [ ! -L "$PREFIX" ] || die "refusing to remove a symlinked prefix: $PREFIX"
+  if [ -e "$PREFIX" ] && [ ! -d "$PREFIX" ]; then
+    die "prefix exists but is not a directory: $PREFIX"
+  fi
+
+  [ "$resolved_cache" != "/" ] || die "refusing to remove the root directory as installer cache"
+  [ "$resolved_cache" != "$resolved_home" ] || die "refusing to remove the home directory as installer cache"
+  refuse_system_tree "$resolved_cache" cache
+  case "$resolved_home/" in
+    "$resolved_cache/"*) die "refusing to remove a cache containing the home directory" ;;
+  esac
+  case "$resolved_prefix/" in
+    "$resolved_cache/"*) die "refusing to remove a cache containing the prefix" ;;
+  esac
+  case "$resolved_cache/" in
+    "$resolved_prefix/"*) die "refusing to remove a cache inside the prefix" ;;
+  esac
+  case "$script_dir/" in
+    "$resolved_cache/"*) die "refusing to remove a cache containing the installer" ;;
+  esac
+  case "$resolved_cache/" in
+    "$script_dir/"*) die "refusing to remove a cache inside the installer directory" ;;
+  esac
+  [ ! -L "$CACHE_DIR" ] || die "refusing to remove a symlinked cache: $CACHE_DIR"
+  if [ -e "$CACHE_DIR" ] && [ ! -d "$CACHE_DIR" ]; then
+    die "cache path exists but is not a directory: $CACHE_DIR"
+  fi
+
+  user_config="${XDG_CONFIG_HOME:-$HOME/.config}/byond/byond-launch.conf"
+  user_launcher="${BIN_DIR:-$HOME/.local/bin}/byond-launcher"
+  apps_user="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  user_desktop="$apps_user/byond.desktop"
+  identity_file="${XDG_DATA_HOME:-$HOME/.local/share}/.byond-wine/MachineIdentities.conf"
+  mimeapps="${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list"
+  [ ! -L "$mimeapps" ] || die "refusing to replace symlinked MIME configuration: $mimeapps"
+
+  log "Removal will permanently delete:"
+  log "  prefix and timestamped backups: $PREFIX"
+  log "  installer cache: $CACHE_DIR"
+  log "  user launcher/config/desktop and BYOND identity"
+  log "  system launcher/config/desktop (if present; may require sudo)"
+  log "  BYOND URL-handler registration"
+  confirm "Continue with complete BYOND removal?" || {
+    log "removal cancelled"
+    return 0
+  }
+
+  if [ -e "$PREFIX" ]; then
+    rm -rf -- "$PREFIX" || die "could not remove prefix: $PREFIX"
+    log "removed prefix $PREFIX"
+  fi
+  for backup in "${PREFIX}.backup-"*; do
+    [ -e "$backup" ] || [ -L "$backup" ] || continue
+    backup_suffix="${backup#"${PREFIX}.backup-"}"
+    [[ "$backup_suffix" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || continue
+    rm -rf -- "$backup" || die "could not remove prefix backup: $backup"
+    log "removed prefix backup $backup"
+  done
+  if [ -e "$CACHE_DIR" ]; then
+    rm -rf -- "$CACHE_DIR" || die "could not remove installer cache: $CACHE_DIR"
+    log "removed installer cache $CACHE_DIR"
+  fi
+
+  remove_file "$user_config"
+  remove_file "$user_launcher"
+  remove_file "$user_desktop"
+  remove_file "$apps_user/byond-url-handler.desktop"
+  remove_file "$identity_file"
+  remove_mime_association
+
+  remove_file "/etc/byond/byond-launch.conf" 1
+  remove_file "/usr/local/bin/byond-launcher" 1
+  remove_file "/usr/share/applications/byond.desktop" 1
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$apps_user" \
+      || warn "could not refresh user desktop database"
+    if [ "$EUID" -eq 0 ]; then
+      update-desktop-database /usr/share/applications \
+        || warn "could not refresh system desktop database"
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo update-desktop-database /usr/share/applications \
+        || warn "could not refresh system desktop database"
+    fi
+  fi
+  remove_empty_dir "${XDG_CONFIG_HOME:-$HOME/.config}/byond"
+  remove_empty_dir "${XDG_DATA_HOME:-$HOME/.local/share}/.byond-wine"
+  remove_empty_dir "$(dirname -- "$PREFIX")"
+  remove_empty_dir /etc/byond 1
+  log "BYOND removal complete"
+}
+
 # ---------------------------------------------------------------------------
 # Flags
 # ---------------------------------------------------------------------------
@@ -199,6 +429,7 @@ while [ $# -gt 0 ]; do
     -h|--help)            usage ;;
     --prefix)             PREFIX="$2"; shift 2 ;;
     --fresh)              FRESH_INSTALL=1; shift ;;
+    --remove)             REMOVE_INSTALL=1; shift ;;
     --wine)               WINE_BIN="$2"; shift 2 ;;
     --byond-version)      BYOND_VERSION="$2"; shift 2 ;;
     --byond-url)          BYOND_URL="$2"; shift 2 ;;
@@ -227,6 +458,11 @@ if [ "$PREFIX" != "/" ]; then PREFIX="${PREFIX%/}"; fi
 [ "$PREFIX" != "/" ] || die "prefix cannot be /"
 [ "$FRESH_INSTALL" != "1" ] || [ "$LAUNCHER_ONLY" != "1" ] \
   || die "--fresh cannot be used with --launcher-only"
+
+if [ "$REMOVE_INSTALL" = "1" ]; then
+  remove_installation
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Preflight

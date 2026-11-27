@@ -2,6 +2,20 @@
 A collection of tips and tricks for getting byond running on linux<br />
 
 This guide is based on the [Lutris](https://lutris.net/games/byond/) installer
+
+## Standalone installer removal
+
+To remove the standalone installation, run `bash install-byond.sh --remove`.
+The command asks for confirmation, then removes the selected Wine prefix and
+its timestamped fresh-install backups, the installer cache, BYOND launcher and
+desktop files (both user and system locations), and the BYOND URL registration
+and saved identity. Use `--prefix DIR` if the installation used a non-default
+prefix. System files may require `sudo`.
+
+This permanently deletes all data inside the selected prefix and installer
+cache. It does not uninstall Wine, Winetricks, or other system packages, which
+the installer does not install.
+
 ## If you are running into issues with the lutris install script, check if the x64byond.yaml works, as it is normally more up to date.<br > 
 # Please do not use the default Proton-Ge wine provided with lutris, Use a wine version greater then or equal to 10.8 
 webview2 requires patches made to wine in 10.5. Proton is based on 10.0, so until the wine patches are ported to GE or proton gets rebased to 11.0, please use a system wine instead.
