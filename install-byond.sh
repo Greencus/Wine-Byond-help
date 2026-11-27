@@ -417,11 +417,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3b. Glyph patch: merge hieroglyph / emoji / runic / math outlines into the
-#     four fonts WebView2 actually uses. WebView2 under Wine ignores host
-#     fontconfig and fonts merely copied into C:\windows\Fonts, so the outlines
-#     must live inside arial/times/tahoma/micross. Also replaces Proton font
-#     symlinks with regular files (never writes through them).
+# 3b. Prepare glyph source fonts and invoke the shared font-patch script.
+#     The helper handles merging, backups, symlinks, and verification.
 # ---------------------------------------------------------------------------
 if [ "$FONT_PATCH" = "1" ]; then
   if pgrep -x byond.exe >/dev/null 2>&1; then
