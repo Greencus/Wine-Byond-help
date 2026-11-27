@@ -720,7 +720,7 @@ bash "$CACHE_DIR/NT-ID.sh" "$PREFIX" || warn "NT-ID step failed"
 # ---------------------------------------------------------------------------
 log "installing WebView2 runtime (this can take a few minutes)"
 download "$WEBVIEW2_URL" "$CACHE_DIR/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
-wine_run "$CACHE_DIR/MicrosoftEdgeWebView2RuntimeInstallerX64.exe" /silent /install >/dev/null 2>&1 \
+wine_run "$CACHE_DIR/MicrosoftEdgeWebView2RuntimeInstallerX64.exe" /install >/dev/null 2>&1 \
   || warn "WebView2 installer returned non-zero (often harmless)"
 wine_run taskkill /f /im MicrosoftEdgeUpdate.exe >/dev/null 2>&1 || true
 
