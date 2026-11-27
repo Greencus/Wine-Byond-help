@@ -26,6 +26,7 @@
 #   --remove                Remove the prefix, its backups, cache, and BYOND launcher files
 #   --wine PATH             wine binary  (default: /usr/bin/wine, must be >=10.8)
 #   --byond-version VER     BYOND build  (default: 516.1667)
+#   --byond-url URL         BYOND installer URL (defaults to the selected build)
 #   --no-dxvk               Do not install DXVK / do not set DXVK overrides
 #   --no-vkd3d              Do not install VKD3D when DXVK is enabled
 #   --vkd3d-version VER     VKD3D release (default: 2.14)
@@ -72,7 +73,11 @@ FONT_PATCH="${FONT_PATCH:-1}"       # 1 = merge hieroglyph/emoji/runic/math glyp
 WINE_BIN="${WINE_BIN:-/usr/bin/wine}"
 PREFIX="${PREFIX:-$HOME/Games/byond}"
 BYOND_VERSION="${BYOND_VERSION:-516.1667}"
-BYOND_URL="${BYOND_URL:-https://www.byond.com/download/build/516/${BYOND_VERSION}_byond.exe}"
+BYOND_URL_CUSTOM=0
+if [ -n "${BYOND_URL:-}" ]; then
+  BYOND_URL_CUSTOM=1
+fi
+BYOND_URL="${BYOND_URL:-}"
 WEBVIEW2_URL="${WEBVIEW2_URL:-https://go.microsoft.com/fwlink/?linkid=2124701}"
 DXVK_ENABLED="${DXVK_ENABLED:-1}"
 DXVK_VERSION="${DXVK_VERSION:-2.6.2}"
@@ -444,7 +449,7 @@ while [ $# -gt 0 ]; do
     --remove)             REMOVE_INSTALL=1; shift ;;
     --wine)               WINE_BIN="$2"; shift 2 ;;
     --byond-version)      BYOND_VERSION="$2"; shift 2 ;;
-    --byond-url)          BYOND_URL="$2"; shift 2 ;;
+    --byond-url)          BYOND_URL="$2"; BYOND_URL_CUSTOM=1; shift 2 ;;
     --no-dxvk)            DXVK_ENABLED=0; shift ;;
     --no-vkd3d)           VKD3D_ENABLED=0; shift ;;
     --vkd3d-version)      VKD3D_VERSION="$2"; shift 2
@@ -491,6 +496,15 @@ if [ "$PREFIX" != "/" ]; then PREFIX="${PREFIX%/}"; fi
 if [ "$REMOVE_INSTALL" = "1" ]; then
   remove_installation
   exit 0
+fi
+
+if [ "$BYOND_URL_CUSTOM" = "0" ]; then
+  BYOND_BUILD_SERIES="${BYOND_VERSION%%.*}"
+  BYOND_BUILD_NUMBER="${BYOND_VERSION#*.}"
+  [ "$BYOND_BUILD_SERIES" != "$BYOND_VERSION" ] && [ -n "$BYOND_BUILD_SERIES" ] \
+    && [ -n "$BYOND_BUILD_NUMBER" ] \
+    || die "BYOND version must include a build series and build number, such as 516.1667"
+  BYOND_URL="https://www.byond.com/download/build/${BYOND_BUILD_SERIES}/${BYOND_VERSION}_byond.exe"
 fi
 
 # ---------------------------------------------------------------------------
