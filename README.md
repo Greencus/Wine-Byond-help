@@ -3,6 +3,14 @@ A collection of tips and tricks for getting byond running on linux<br />
 
 This guide is based on the [Lutris](https://lutris.net/games/byond/) installer
 
+## Standalone installer graphics
+
+The standalone installer enables DXVK and D3D Extras v2 by default. VKD3D
+2.14 is enabled when DXVK is enabled, and automatically disabled when DXVK is
+off; it cannot be enabled without DXVK. Use `--no-vkd3d` to disable it while
+DXVK is on. D3D Extras can be disabled with `--no-d3d-extras`. Select different
+releases with `--vkd3d-version` and `--d3d-extras-version`.
+
 ## Standalone installer removal
 
 To remove the standalone installation, run `bash install-byond.sh --remove`.

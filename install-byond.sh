@@ -27,6 +27,10 @@
 #   --wine PATH             wine binary  (default: /usr/bin/wine, must be >=10.8)
 #   --byond-version VER     BYOND build  (default: 516.1667)
 #   --no-dxvk               Do not install DXVK / do not set DXVK overrides
+#   --no-vkd3d              Do not install VKD3D when DXVK is enabled
+#   --vkd3d-version VER     VKD3D release (default: 2.14)
+#   --no-d3d-extras         Do not install D3D Extras (enabled by default)
+#   --d3d-extras-version VER D3D Extras release (default: v2)
 #   --renderer-limit N      WebView2 renderer process limit (default: 4)
 #   --no-font-patch         Skip merging hieroglyph/emoji/runic/math glyphs
 #   --math-font PATH        Math glyph source (Symbola.ttf recommended)
@@ -73,6 +77,12 @@ WEBVIEW2_URL="${WEBVIEW2_URL:-https://go.microsoft.com/fwlink/?linkid=2124701}"
 DXVK_ENABLED="${DXVK_ENABLED:-1}"
 DXVK_VERSION="${DXVK_VERSION:-2.6.2}"
 DXVK_URL="${DXVK_URL:-https://github.com/doitsujin/dxvk/releases/download/v${DXVK_VERSION}/dxvk-${DXVK_VERSION}.tar.gz}"
+VKD3D_ENABLED="${VKD3D_ENABLED:-auto}"
+VKD3D_VERSION="${VKD3D_VERSION:-2.14}"
+VKD3D_URL="${VKD3D_URL:-https://github.com/lutris/vkd3d/releases/download/v${VKD3D_VERSION}/vkd3d-${VKD3D_VERSION}.tar.xz}"
+D3D_EXTRAS_ENABLED="${D3D_EXTRAS_ENABLED:-1}"
+D3D_EXTRAS_VERSION="${D3D_EXTRAS_VERSION:-v2}"
+D3D_EXTRAS_URL="${D3D_EXTRAS_URL:-https://github.com/lutris/d3d_extras/releases/download/${D3D_EXTRAS_VERSION}/${D3D_EXTRAS_VERSION}.tar.xz}"
 WEBVIEW2_RENDERER_LIMIT="${WEBVIEW2_RENDERER_LIMIT:-4}"
 
 SYSTEM_INSTALL="${SYSTEM_INSTALL:-1}"   # 1 => /usr/local,/usr/share,/etc ; 0 => ~/.local,~/.config
@@ -436,6 +446,12 @@ while [ $# -gt 0 ]; do
     --byond-version)      BYOND_VERSION="$2"; shift 2 ;;
     --byond-url)          BYOND_URL="$2"; shift 2 ;;
     --no-dxvk)            DXVK_ENABLED=0; shift ;;
+    --no-vkd3d)           VKD3D_ENABLED=0; shift ;;
+    --vkd3d-version)      VKD3D_VERSION="$2"; shift 2
+                          VKD3D_URL="https://github.com/lutris/vkd3d/releases/download/v${VKD3D_VERSION}/vkd3d-${VKD3D_VERSION}.tar.xz" ;;
+    --no-d3d-extras)      D3D_EXTRAS_ENABLED=0; shift ;;
+    --d3d-extras-version) D3D_EXTRAS_VERSION="$2"; shift 2
+                          D3D_EXTRAS_URL="https://github.com/lutris/d3d_extras/releases/download/${D3D_EXTRAS_VERSION}/${D3D_EXTRAS_VERSION}.tar.xz" ;;
     --no-font-patch)      FONT_PATCH=0; shift ;;
     --math-font)          MATH_FONT="$2"; shift 2 ;;
     --symbola-url)          SYMBOLA_URL="$2"; shift 2 ;;
@@ -453,6 +469,17 @@ while [ $# -gt 0 ]; do
     *) die "unknown option: $1 (try --help)" ;;
   esac
 done
+
+if [ "$VKD3D_ENABLED" = "auto" ]; then
+  VKD3D_ENABLED="$DXVK_ENABLED"
+fi
+case "$VKD3D_ENABLED" in
+  0|1) ;;
+  *) die "VKD3D_ENABLED must be 0, 1, or auto" ;;
+esac
+if [ "$DXVK_ENABLED" != "1" ]; then
+  VKD3D_ENABLED=0
+fi
 
 export PREFIX WINE_BIN
 if [ "$PREFIX" != "/" ]; then PREFIX="${PREFIX%/}"; fi
@@ -474,11 +501,14 @@ log "  wine        : $WINE_BIN"
 log "  prefix      : $PREFIX"
 log "  BYOND       : $BYOND_VERSION"
 log "  DXVK        : $DXVK_ENABLED (v$DXVK_VERSION)"
+log "  VKD3D       : $VKD3D_ENABLED (v$VKD3D_VERSION)"
+log "  D3D Extras  : $D3D_EXTRAS_ENABLED ($D3D_EXTRAS_VERSION)"
 log "  repo base   : $REPO_BASE"
 log "  fresh       : $FRESH_INSTALL"
 
 need "$WINE_BIN"
 need winetricks; need curl; need unzip; need tar; need sha256sum
+if [ "$VKD3D_ENABLED" = "1" ] || [ "$D3D_EXTRAS_ENABLED" = "1" ]; then need xz; fi
 mkdir -p "$CACHE_DIR"
 
 "$WINE_BIN" --version >/dev/null 2>&1 || die "wine binary not runnable: $WINE_BIN"
@@ -488,10 +518,30 @@ log "detected wine: $wine_ver (need >= 10.8, 11.x recommended)"
 # ---------------------------------------------------------------------------
 # Artifact generation (config + launcher + desktop entry)
 # ---------------------------------------------------------------------------
+dll_override_names=()
 if [ "$DXVK_ENABLED" = "1" ]; then
-  dll_overrides='d3d10core,d3d11,d3d12,dxgi=n'
-else
-  dll_overrides=''
+  dll_override_names+=(d3d10core d3d11 dxgi)
+fi
+if [ "$VKD3D_ENABLED" = "1" ]; then
+  dll_override_names+=(d3d12 d3d12core)
+fi
+if [ "$D3D_EXTRAS_ENABLED" = "1" ]; then
+  dll_override_names+=(
+    d3dx10_33 d3dx10_34 d3dx10_35 d3dx10_36 d3dx10_37 d3dx10_38
+    d3dx10_39 d3dx10_40 d3dx10_41 d3dx10_42 d3dx10_43 d3dx10
+    d3dx11_42 d3dx11_43
+    d3dx9_24 d3dx9_25 d3dx9_26 d3dx9_27 d3dx9_28 d3dx9_29 d3dx9_30
+    d3dx9_31 d3dx9_32 d3dx9_33 d3dx9_34 d3dx9_35 d3dx9_36 d3dx9_37
+    d3dx9_38 d3dx9_39 d3dx9_40 d3dx9_41 d3dx9_42 d3dx9_43
+    d3dcompiler_33 d3dcompiler_34 d3dcompiler_35 d3dcompiler_36
+    d3dcompiler_37 d3dcompiler_38 d3dcompiler_39 d3dcompiler_40
+    d3dcompiler_41 d3dcompiler_42 d3dcompiler_43 d3dcompiler_46
+    d3dcompiler_47
+  )
+fi
+dll_overrides=""
+if [ "${#dll_override_names[@]}" -gt 0 ]; then
+  dll_overrides="$(IFS=,; printf '%s' "${dll_override_names[*]}")=n"
 fi
 
 gen_artifacts() { # gen_artifacts <outdir>
@@ -511,7 +561,7 @@ WINEPREFIX="$PREFIX"
 # The BYOND executable, as a Windows path.
 GAME_EXE='C:\\Program Files (x86)\\BYOND\\bin\\byond.exe'
 
-# DLL overrides (DXVK). Leave empty to use Wine's built-in wined3d.
+# DLL overrides for the enabled DXVK, VKD3D, and D3D Extras components.
 WINEDLLOVERRIDES="$dll_overrides"
 
 # Environment (matches a fast, well-behaved configuration).
@@ -712,6 +762,36 @@ if [ "$DXVK_ENABLED" = "1" ]; then
   # a Lutris runtime dir) DLL instead of writing through the symlink.
   cp -f --remove-destination "$dxvk_root/x64/"*.dll "$PREFIX/drive_c/windows/system32/"
   cp -f --remove-destination "$dxvk_root/x32/"*.dll "$PREFIX/drive_c/windows/syswow64/"
+fi
+
+if [ "$VKD3D_ENABLED" = "1" ]; then
+  log "installing VKD3D v$VKD3D_VERSION"
+  vkd3d_archive="$CACHE_DIR/vkd3d-${VKD3D_VERSION}.tar.xz"
+  download "$VKD3D_URL" "$vkd3d_archive"
+  rm -rf "$CACHE_DIR/vkd3d"
+  mkdir -p "$CACHE_DIR/vkd3d"
+  tar -xJf "$vkd3d_archive" -C "$CACHE_DIR/vkd3d"
+  vkd3d_root="$CACHE_DIR/vkd3d/vkd3d-${VKD3D_VERSION}"
+  [ -f "$vkd3d_root/x64/d3d12.dll" ] && [ -f "$vkd3d_root/x64/d3d12core.dll" ] \
+    && [ -f "$vkd3d_root/x86/d3d12.dll" ] && [ -f "$vkd3d_root/x86/d3d12core.dll" ] \
+    || die "VKD3D archive has an unexpected layout"
+  cp -f --remove-destination "$vkd3d_root/x64/"*.dll "$PREFIX/drive_c/windows/system32/"
+  cp -f --remove-destination "$vkd3d_root/x86/"*.dll "$PREFIX/drive_c/windows/syswow64/"
+fi
+
+if [ "$D3D_EXTRAS_ENABLED" = "1" ]; then
+  log "installing D3D Extras $D3D_EXTRAS_VERSION"
+  d3d_extras_archive="$CACHE_DIR/d3d-extras-${D3D_EXTRAS_VERSION}.tar.xz"
+  download "$D3D_EXTRAS_URL" "$d3d_extras_archive"
+  rm -rf "$CACHE_DIR/d3d-extras"
+  mkdir -p "$CACHE_DIR/d3d-extras"
+  tar -xJf "$d3d_extras_archive" -C "$CACHE_DIR/d3d-extras"
+  d3d_extras_root="$CACHE_DIR/d3d-extras/$D3D_EXTRAS_VERSION"
+  [ -f "$d3d_extras_root/x64/d3dcompiler_47.dll" ] \
+    && [ -f "$d3d_extras_root/x32/d3dcompiler_47.dll" ] \
+    || die "D3D Extras archive has an unexpected layout"
+  cp -f --remove-destination "$d3d_extras_root/x64/"*.dll "$PREFIX/drive_c/windows/system32/"
+  cp -f --remove-destination "$d3d_extras_root/x32/"*.dll "$PREFIX/drive_c/windows/syswow64/"
 fi
 
 # ---------------------------------------------------------------------------
