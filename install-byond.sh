@@ -49,6 +49,7 @@ set -Eeuo pipefail
 REPO_BASE="${REPO_BASE:-https://raw.githubusercontent.com/kinggoldcatter/Wine-Byond-help/master}"
 SMOFONT_URL="${SMOFONT_URL:-${REPO_BASE}/extra/fonts/smalle.zip}"
 NTID_URL="${NTID_URL:-${REPO_BASE}/extra/NT-ID.sh}"
+SPACE_HANDLER_URL="${SPACE_HANDLER_URL:-${REPO_BASE}/extra/space-handler.sh}"
 # Glyph-source fonts for the WebView2 font patch (see byond-font-patch.py).
 EGYPT_URL="${EGYPT_URL:-https://raw.githubusercontent.com/google/fonts/main/ofl/notosansegyptianhieroglyphs/NotoSansEgyptianHieroglyphs-Regular.ttf}"
 RUNIC_URL="${RUNIC_URL:-https://raw.githubusercontent.com/google/fonts/main/ofl/notosansrunic/NotoSansRunic-Regular.ttf}"
@@ -56,7 +57,7 @@ EMOJI_URL="${EMOJI_URL:-https://raw.githubusercontent.com/google/fonts/main/ofl/
 SYMBOLA_URL="${SYMBOLA_URL:-https://fontlibrary.org/api/catalogue/symbola/download}"
 MATH_FONT="${MATH_FONT:-}"          # optional path to Symbola.ttf (preferred math source)
 FONT_PATCH="${FONT_PATCH:-1}"       # 1 = merge hieroglyph/emoji/runic/math glyphs
-# (space-handler.sh is generated locally by this installer, not downloaded.)
+# The shared space-handler.sh is downloaded from REPO_BASE.
 
 # ---------------------------------------------------------------------------
 # Upstream / toolchain variables
@@ -140,7 +141,8 @@ while [ $# -gt 0 ]; do
     --renderer-limit)     WEBVIEW2_RENDERER_LIMIT="$2"; shift 2 ;;
     --repo-base)          REPO_BASE="$2"; shift 2
                           SMOFONT_URL="${REPO_BASE}/extra/fonts/smalle.zip"
-                          NTID_URL="${REPO_BASE}/extra/NT-ID.sh" ;;
+                          NTID_URL="${REPO_BASE}/extra/NT-ID.sh"
+                          SPACE_HANDLER_URL="${REPO_BASE}/extra/space-handler.sh" ;;
     --user)               SYSTEM_INSTALL=0; shift ;;
     --system)             SYSTEM_INSTALL=1; shift ;;
     --yes)                ASSUME_YES=1; shift ;;
@@ -250,6 +252,7 @@ export WINEPREFIX
 if [ $# -ge 1 ] && [[ "$1" == *"://"* ]]; then
   handler="$WINEPREFIX/space-handler.sh"
   [ -x "$handler" ] || { echo "byond-launcher: missing $handler" >&2; exit 1; }
+  export BYOND_LAUNCHER="${BYOND_LAUNCHER:-$0}"
   exec "$handler" "$1"
 fi
 
@@ -960,82 +963,11 @@ if [ "$FONT_PATCH" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. byond:// URL handler (adapted: launches via byond-launcher, not Lutris)
+# 4. byond:// URL handler (shared helper)
 # ---------------------------------------------------------------------------
 log "installing byond:// URL handler"
-cat > "$PREFIX/space-handler.sh" <<'HANDLER'
-#!/usr/bin/env bash
-# Forward a byond:// URL from the host browser to BYOND in this wine prefix.
-set -euo pipefail
-self="$(readlink -f "$0")"
-prefix_dir="$(dirname "$self")"
-launcher="${BYOND_LAUNCHER:-byond-launcher}"
-
-if [ "${1:-}" = "--register" ]; then
-  command -v xdg-mime >/dev/null || { echo "Error: xdg-mime not found." >&2; exit 0; }
-  apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-  # Prefer the single BYOND entry installed by install-byond.sh (it carries
-  # MimeType=x-scheme-handler/byond and Exec=... %u).
-  for cand in /usr/share/applications/byond.desktop "$apps/byond.desktop"; do
-    if [ -f "$cand" ]; then
-      mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}"
-      xdg-mime default byond.desktop x-scheme-handler/byond
-      echo "Registered byond.desktop as the byond url handler."
-      exit 0
-    fi
-  done
-  mkdir -p "$apps"
-  cat > "$apps/byond-url-handler.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=BYOND URL Handler
-Exec="$self" %u
-NoDisplay=true
-Terminal=false
-MimeType=x-scheme-handler/byond;
-EOF
-  command -v update-desktop-database >/dev/null && update-desktop-database "$apps" || true
-  xdg-mime default byond-url-handler.desktop x-scheme-handler/byond
-  echo "Registered $self as the byond url handler."
-  exit 0
-fi
-
-url="${1:-}"
-[ -n "$url" ] || { echo "usage: $0 <byond-url> | --register" >&2; exit 1; }
-export WINEPREFIX="${WINEPREFIX:-$prefix_dir}"
-export WINEDEBUG="${WINEDEBUG:--all}"
-
-in_prefix() { tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | grep -qxF "WINEPREFIX=$WINEPREFIX"; }
-find_pager() {
-  server_exe=""
-  local byond_pid pid
-  for byond_pid in $(pgrep -if 'byond\.exe'); do
-    in_prefix "$byond_pid" || continue
-    for pid in $(pgrep -x wineserver); do
-      if in_prefix "$pid"; then server_exe="$(readlink -f "/proc/$pid/exe")"; return 0; fi
-    done
-  done
-  return 1
-}
-
-if ! find_pager; then
-  if command -v "$launcher" >/dev/null 2>&1; then
-    setsid "$launcher" >/dev/null 2>&1 &
-  else
-    echo "BYOND is not running and launcher '$launcher' not found." >&2
-    exit 1
-  fi
-  for _ in $(seq 40); do sleep 2; find_pager && break; done
-  [ -n "${server_exe:-}" ] || { echo "Timed out waiting for BYOND to start." >&2; exit 1; }
-  sleep 5
-fi
-
-WINE="${WINE:-$(dirname "$server_exe")/wine}"
-location="Program Files (x86)"
-[ -d "$WINEPREFIX/drive_c/$location/BYOND" ] || location="Program Files"
-exec "$WINE" "C:\\$location\\BYOND\\bin\\byond.exe" -url "$url"
-HANDLER
-chmod +x "$PREFIX/space-handler.sh"
+download "$SPACE_HANDLER_URL" "$CACHE_DIR/space-handler.sh"
+place "$CACHE_DIR/space-handler.sh" "$PREFIX/space-handler.sh" 755 0
 bash "$PREFIX/space-handler.sh" --register || warn "URL handler registration failed (XDG?)"
 
 # ---------------------------------------------------------------------------
