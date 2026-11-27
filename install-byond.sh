@@ -310,7 +310,7 @@ remove_installation() {
   need mktemp
   need find
   local resolved_prefix resolved_cache resolved_home script_dir
-  local user_config user_launcher user_desktop apps_user identity_file mimeapps
+  local user_config user_launcher user_desktop apps_user mimeapps
   local backup backup_suffix
   resolved_prefix="$(readlink -m -- "$PREFIX")" || die "could not resolve prefix path"
   resolved_cache="$(readlink -m -- "$CACHE_DIR")" || die "could not resolve cache path"
@@ -361,14 +361,13 @@ remove_installation() {
   user_launcher="${BIN_DIR:-$HOME/.local/bin}/byond-launcher"
   apps_user="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   user_desktop="$apps_user/byond.desktop"
-  identity_file="${XDG_DATA_HOME:-$HOME/.local/share}/.byond-wine/MachineIdentities.conf"
   mimeapps="${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list"
   [ ! -L "$mimeapps" ] || die "refusing to replace symlinked MIME configuration: $mimeapps"
 
   log "Removal will permanently delete:"
   log "  prefix and timestamped backups: $PREFIX"
   log "  installer cache: $CACHE_DIR"
-  log "  user launcher/config/desktop and BYOND identity"
+  log "  user launcher/config/desktop (BYOND machine identity is preserved)"
   log "  system launcher/config/desktop (if present; may require sudo)"
   log "  BYOND URL-handler registration"
   confirm "Continue with complete BYOND removal?" || {
@@ -396,7 +395,6 @@ remove_installation() {
   remove_file "$user_launcher"
   remove_file "$user_desktop"
   remove_file "$apps_user/byond-url-handler.desktop"
-  remove_file "$identity_file"
   remove_mime_association
 
   remove_file "/etc/byond/byond-launch.conf" 1
@@ -404,14 +402,18 @@ remove_installation() {
   remove_file "/usr/share/applications/byond.desktop" 1
 
   if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "$apps_user" \
-      || warn "could not refresh user desktop database"
-    if [ "$EUID" -eq 0 ]; then
-      update-desktop-database /usr/share/applications \
-        || warn "could not refresh system desktop database"
-    elif command -v sudo >/dev/null 2>&1; then
-      sudo update-desktop-database /usr/share/applications \
-        || warn "could not refresh system desktop database"
+    if [ -d "$apps_user" ]; then
+      update-desktop-database "$apps_user" \
+        || warn "could not refresh user desktop database"
+    fi
+    if [ -d /usr/share/applications ]; then
+      if [ "$EUID" -eq 0 ]; then
+        update-desktop-database /usr/share/applications \
+          || warn "could not refresh system desktop database"
+      elif command -v sudo >/dev/null 2>&1; then
+        sudo update-desktop-database /usr/share/applications \
+          || warn "could not refresh system desktop database"
+      fi
     fi
   fi
   remove_empty_dir "${XDG_CONFIG_HOME:-$HOME/.config}/byond"

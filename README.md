@@ -9,8 +9,8 @@ To remove the standalone installation, run `bash install-byond.sh --remove`.
 The command asks for confirmation, then removes the selected Wine prefix and
 its timestamped fresh-install backups, the installer cache, BYOND launcher and
 desktop files (both user and system locations), and the BYOND URL registration
-and saved identity. Use `--prefix DIR` if the installation used a non-default
-prefix. System files may require `sudo`.
+but preserves the saved NT-ID identity. Use `--prefix DIR` if the
+installation used a non-default prefix. System files may require `sudo`.
 
 This permanently deletes all data inside the selected prefix and installer
 cache. It does not uninstall Wine, Winetricks, or other system packages, which
