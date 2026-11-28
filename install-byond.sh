@@ -797,7 +797,8 @@ cleanup_menu
 "$WINE_BIN" "$GAME_EXE" "${args[@]}" &
 game_pid=$!
 if [ "${SPACE_WATCHDOG_ENABLED:-0}" = "1" ]; then
-  WINE="$WINE_BIN" "$watchdog" --prefix "$WINEPREFIX" >>"$WINEPREFIX/space-watchdog.log" 2>&1 &
+  # Let the watchdog derive its prefix from the directory where it is installed.
+  env -u WINEPREFIX WINE="$WINE_BIN" "$watchdog" >>"$WINEPREFIX/space-watchdog.log" 2>&1 &
 fi
 trap 'kill -TERM "$game_pid" 2>/dev/null' INT TERM
 rc=0
