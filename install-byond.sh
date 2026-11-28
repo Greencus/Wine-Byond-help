@@ -112,22 +112,119 @@ warn() { printf '%s[warn]%s %s\n'  "$c_yel"  "$c_off" "$*" >&2; }
 die()  { printf '%s[error]%s %s\n' "$c_red"  "$c_off" "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 
+ACTIVE_CHILD_PID=""
+ACTIVE_PART_FILE=""
+ACTIVE_TEMP_FILE=""
+CACHE_CLEANUP_PATH=""
+PREFIX_CLEANUP_PATH=""
+CLEANUP_DONE=0
+
+cleanup_temporary_files() {
+  [ "$CLEANUP_DONE" = "1" ] && return 0
+  CLEANUP_DONE=1
+  if [ -n "$ACTIVE_PART_FILE" ]; then
+    rm -f -- "$ACTIVE_PART_FILE" || warn "could not remove partial download: $ACTIVE_PART_FILE"
+    ACTIVE_PART_FILE=""
+  fi
+  if [ -n "$ACTIVE_TEMP_FILE" ]; then
+    rm -f -- "$ACTIVE_TEMP_FILE" || warn "could not remove temporary file: $ACTIVE_TEMP_FILE"
+    ACTIVE_TEMP_FILE=""
+  fi
+}
+
+paths_overlap() {
+  local first="${1%/}" second="${2%/}"
+  [ -n "$first" ] || first="/"
+  [ -n "$second" ] || second="/"
+  [ "$first" != "/" ] && [ "$second" != "/" ] || return 0
+  [ "$first" = "$second" ] && return 0
+  case "$first/" in "$second/"*) return 0 ;; esac
+  case "$second/" in "$first/"*) return 0 ;; esac
+  return 1
+}
+
+safe_interrupt_cleanup_path() {
+  local path="$1" home_path script_path protected
+  [ "$path" != "/" ] || return 1
+  home_path="$(readlink -m -- "$HOME")" || return 1
+  script_path="$(cd -- "$(dirname -- "$0")" && pwd -P)" || return 1
+  [ "$path" != "$home_path" ] || return 1
+  case "$home_path/" in "$path/"*) return 1 ;; esac
+  case "$script_path/" in "$path/"*) return 1 ;; esac
+  case "$path/" in "$script_path/"*) return 1 ;; esac
+
+  for protected in /usr /etc /var /bin /sbin /lib /lib64 /boot /dev /proc /sys /run; do
+    [ "$path" != "$protected" ] || return 1
+    case "$protected/" in "$path/"*) return 1 ;; esac
+    case "$path/" in "$protected/"*) return 1 ;; esac
+  done
+  for protected in /tmp /home /root /mnt /media /opt /srv; do
+    [ "$path" != "$protected" ] || return 1
+    case "$protected/" in "$path/"*) return 1 ;; esac
+  done
+  return 0
+}
+
+cleanup_created_directories() {
+  local path
+  for path in "$PREFIX_CLEANUP_PATH" "$CACHE_CLEANUP_PATH"; do
+    [ -n "$path" ] || continue
+    if [ -L "$path" ]; then
+      warn "preserving cleanup path that became a symlink: $path"
+    elif [ -d "$path" ]; then
+      log "removing installer-created directory: $path"
+      rm -rf -- "$path" || warn "could not remove installer-created directory: $path"
+    fi
+  done
+  PREFIX_CLEANUP_PATH=""
+  CACHE_CLEANUP_PATH=""
+}
+
+handle_interrupt() {
+  local signal="$1" status="$2" child="${ACTIVE_CHILD_PID:-}"
+  trap '' INT TERM
+  if [ -n "$child" ]; then
+    kill -TERM "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+    ACTIVE_CHILD_PID=""
+  fi
+  warn "received $signal; stopping installer"
+  cleanup_temporary_files
+  cleanup_created_directories
+  exit "$status"
+}
+
+run_child() {
+  "$@" &
+  ACTIVE_CHILD_PID=$!
+  local status=0
+  wait "$ACTIVE_CHILD_PID" || status=$?
+  ACTIVE_CHILD_PID=""
+  return "$status"
+}
+
+trap cleanup_temporary_files EXIT
+trap 'handle_interrupt INT 130' INT
+trap 'handle_interrupt TERM 143' TERM
+
 usage() { awk 'NR<=2{next} /^# ={10,}$/{exit} {sub(/^# ?/,""); print}' "$0"; exit 0; }
 
 first_file() { for f in "$@"; do [ -n "$f" ] && [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }; done; return 1; }
 
 wine_run() {
   WINEPREFIX="$PREFIX" WINEARCH=win64 WINEDEBUG="${WINEDEBUG:--all}" \
-    "$WINE_BIN" "$@"
+    run_child "$WINE_BIN" "$@"
 }
 
 download() { # download <url> <dest-file>
-  local url="$1" dest="$2"
+  local url="$1" dest="$2" part="${2}.part"
   if [ -s "$dest" ]; then log "using cached $(basename "$dest")"; return 0; fi
   log "downloading $(basename "$dest")"
-  curl -fL --retry 3 --connect-timeout 20 --max-time 900 -o "$dest.part" "$url" \
-    || { rm -f "$dest.part"; die "download failed: $url"; }
-  mv -f "$dest.part" "$dest"
+  ACTIVE_PART_FILE="$part"
+  run_child curl -fL --retry 3 --connect-timeout 20 --max-time 900 -o "$part" "$url" \
+    || die "download failed: $url"
+  mv -f "$part" "$dest" || die "could not save download: $dest"
+  ACTIVE_PART_FILE=""
 }
 
 have_passwordless_sudo() { sudo -n true >/dev/null 2>&1; }
@@ -142,10 +239,10 @@ confirm() { # confirm <prompt>
 place() { # place <src> <dest-abs> <mode> <0|1 use_sudo>
   local src="$1" dest="$2" mode="$3" use_sudo="${4:-0}"
   if [ "$use_sudo" = "1" ]; then
-    sudo install -Dm"$mode" "$src" "$dest"
+    run_child sudo install -Dm"$mode" "$src" "$dest"
   else
     mkdir -p "$(dirname "$dest")"
-    install -m"$mode" "$src" "$dest"
+    run_child install -m"$mode" "$src" "$dest"
   fi
 }
 
@@ -272,6 +369,7 @@ remove_mime_association() {
 
   tmp="$(mktemp "${mimeapps}.byond-remove.XXXXXX")" \
     || die "could not create temporary MIME configuration"
+  ACTIVE_TEMP_FILE="$tmp"
   if ! awk '
     function remove_byond(value, count, ids, i, result, found) {
       count = split(value, ids, ";")
@@ -309,14 +407,17 @@ remove_mime_association() {
   else
     chmod --reference="$mimeapps" "$tmp" || {
       rm -f -- "$tmp"
+      ACTIVE_TEMP_FILE=""
       die "could not preserve permissions for $mimeapps"
     }
     mv -f -- "$tmp" "$mimeapps" || {
       rm -f -- "$tmp"
+      ACTIVE_TEMP_FILE=""
       die "could not update MIME configuration: $mimeapps"
     }
     log "removed BYOND URL association from $mimeapps"
   fi
+  ACTIVE_TEMP_FILE=""
 }
 
 remove_installation() {
@@ -536,6 +637,15 @@ log "  fresh       : $FRESH_INSTALL"
 need "$WINE_BIN"
 need winetricks; need curl; need unzip; need tar; need sha256sum
 if [ "$VKD3D_ENABLED" = "1" ] || [ "$D3D_EXTRAS_ENABLED" = "1" ]; then need xz; fi
+if [ ! -e "$CACHE_DIR" ] && [ ! -L "$CACHE_DIR" ]; then
+  need readlink
+  cache_candidate="$(readlink -m -- "$CACHE_DIR")" || die "could not resolve cache path"
+  prefix_candidate="$(readlink -m -- "$PREFIX")" || die "could not resolve prefix path"
+  if safe_interrupt_cleanup_path "$cache_candidate" \
+      && ! paths_overlap "$cache_candidate" "$prefix_candidate"; then
+    CACHE_CLEANUP_PATH="$cache_candidate"
+  fi
+fi
 mkdir -p "$CACHE_DIR"
 
 "$WINE_BIN" --version >/dev/null 2>&1 || die "wine binary not runnable: $WINE_BIN"
@@ -730,8 +840,16 @@ if [ "$LAUNCHER_ONLY" != "1" ]; then
 log "creating/updating win64 prefix"
 export WINEPREFIX="$PREFIX" WINEARCH=win64
 fresh_prefix
+if [ ! -e "$PREFIX" ] && [ ! -L "$PREFIX" ]; then
+  prefix_candidate="$(readlink -m -- "$PREFIX")" || die "could not resolve prefix path"
+  cache_candidate="$(readlink -m -- "$CACHE_DIR")" || die "could not resolve cache path"
+  if safe_interrupt_cleanup_path "$prefix_candidate" \
+      && ! paths_overlap "$prefix_candidate" "$cache_candidate"; then
+    PREFIX_CLEANUP_PATH="$prefix_candidate"
+  fi
+fi
 mkdir -p "$(dirname "$PREFIX")"
-"$WINE_BIN" wineboot -u >/dev/null 2>&1 || warn "wineboot returned non-zero (often harmless)"
+run_child "$WINE_BIN" wineboot -u >/dev/null 2>&1 || warn "wineboot returned non-zero (often harmless)"
 [ -d "$PREFIX/drive_c" ] || die "prefix was not created at $PREFIX"
 
 # ---------------------------------------------------------------------------
@@ -740,7 +858,7 @@ mkdir -p "$(dirname "$PREFIX")"
 if [ ! -f "$PREFIX/winetricks.log" ] || ! grep -qx 'msftedit' "$PREFIX/winetricks.log" 2>/dev/null; then
   log "installing winetricks verbs (vcrun2022 dxtrans corefonts riched20 msftedit)"
   WINE="$WINE_BIN" WINEPREFIX="$PREFIX" WINEARCH=win64 WINEDEBUG=-all \
-    winetricks -q vcrun2022 dxtrans corefonts riched20 msftedit \
+    run_child winetricks -q vcrun2022 dxtrans corefonts riched20 msftedit \
     || warn "winetricks reported errors - check output if things misbehave"
 else
   log "winetricks verbs already present"
@@ -911,7 +1029,7 @@ if [ "$FONT_PATCH" = "1" ]; then
       fi
     fi
     [ -n "$symbola_font" ] && font_args+=(--math "$symbola_font")
-    python3 "$CACHE_DIR/byond-font-patch.py" "${font_args[@]}" \
+    run_child python3 "$CACHE_DIR/byond-font-patch.py" "${font_args[@]}" \
       || warn "font patch failed - BYOND will run but some Unicode may show as boxes"
   fi
 fi
