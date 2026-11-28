@@ -22,11 +22,19 @@
 #
 # Options:
 #   --prefix DIR            Wine prefix (default: $HOME/Games/byond)
+#   --fresh                 Start from a new prefix; back up old prefix and clear cache
+#   --remove                Remove the prefix, its backups, cache, and BYOND launcher files
 #   --wine PATH             wine binary  (default: /usr/bin/wine, must be >=10.8)
 #   --byond-version VER     BYOND build  (default: 516.1667)
+#   --byond-url URL         BYOND installer URL (defaults to the selected build)
 #   --no-dxvk               Do not install DXVK / do not set DXVK overrides
+#   --no-vkd3d              Do not install VKD3D when DXVK is enabled
+#   --vkd3d-version VER     VKD3D release (default: 2.14)
+#   --no-d3d-extras         Do not install D3D Extras (enabled by default)
+#   --d3d-extras-version VER D3D Extras release (default: v2)
 #   --renderer-limit N      WebView2 renderer process limit (default: 4)
 #   --no-font-patch         Skip merging hieroglyph/emoji/runic/math glyphs
+#   --no-watchdog           Disable Space Watchdog
 #   --math-font PATH        Math glyph source (Symbola.ttf recommended)
 #   --symbola-url URL         Symbola zip URL (fontlibrary.org by default)
 #   --repo-base URL         Base URL of your custom repo (raw github style)
@@ -49,6 +57,10 @@ set -Eeuo pipefail
 REPO_BASE="${REPO_BASE:-https://raw.githubusercontent.com/kinggoldcatter/Wine-Byond-help/master}"
 SMOFONT_URL="${SMOFONT_URL:-${REPO_BASE}/extra/fonts/smalle.zip}"
 NTID_URL="${NTID_URL:-${REPO_BASE}/extra/NT-ID.sh}"
+SPACE_HANDLER_URL="${SPACE_HANDLER_URL:-${REPO_BASE}/extra/space-handler.sh}"
+FONT_PATCH_SCRIPT_URL="${FONT_PATCH_SCRIPT_URL:-${REPO_BASE}/extra/byond-font-patch.py}"
+# Used only when enabled; override while the watchdog asset is not upstream.
+SPACE_WATCHDOG_URL="${SPACE_WATCHDOG_URL:-${REPO_BASE}/extra/space-watchdog.sh}"
 # Glyph-source fonts for the WebView2 font patch (see byond-font-patch.py).
 EGYPT_URL="${EGYPT_URL:-https://raw.githubusercontent.com/google/fonts/main/ofl/notosansegyptianhieroglyphs/NotoSansEgyptianHieroglyphs-Regular.ttf}"
 RUNIC_URL="${RUNIC_URL:-https://raw.githubusercontent.com/google/fonts/main/ofl/notosansrunic/NotoSansRunic-Regular.ttf}"
@@ -56,7 +68,9 @@ EMOJI_URL="${EMOJI_URL:-https://raw.githubusercontent.com/google/fonts/main/ofl/
 SYMBOLA_URL="${SYMBOLA_URL:-https://fontlibrary.org/api/catalogue/symbola/download}"
 MATH_FONT="${MATH_FONT:-}"          # optional path to Symbola.ttf (preferred math source)
 FONT_PATCH="${FONT_PATCH:-1}"       # 1 = merge hieroglyph/emoji/runic/math glyphs
-# (space-handler.sh is generated locally by this installer, not downloaded.)
+# Keep the watchdog off until its script is merged upstream; then change this default to 1.
+SPACE_WATCHDOG_ENABLED="${SPACE_WATCHDOG_ENABLED:-0}"
+# Shared helper scripts are downloaded from REPO_BASE.
 
 # ---------------------------------------------------------------------------
 # Upstream / toolchain variables
@@ -64,17 +78,29 @@ FONT_PATCH="${FONT_PATCH:-1}"       # 1 = merge hieroglyph/emoji/runic/math glyp
 WINE_BIN="${WINE_BIN:-/usr/bin/wine}"
 PREFIX="${PREFIX:-$HOME/Games/byond}"
 BYOND_VERSION="${BYOND_VERSION:-516.1667}"
-BYOND_URL="${BYOND_URL:-https://www.byond.com/download/build/516/${BYOND_VERSION}_byond.exe}"
+BYOND_URL_CUSTOM=0
+if [ -n "${BYOND_URL:-}" ]; then
+  BYOND_URL_CUSTOM=1
+fi
+BYOND_URL="${BYOND_URL:-}"
 WEBVIEW2_URL="${WEBVIEW2_URL:-https://go.microsoft.com/fwlink/?linkid=2124701}"
 DXVK_ENABLED="${DXVK_ENABLED:-1}"
 DXVK_VERSION="${DXVK_VERSION:-2.6.2}"
 DXVK_URL="${DXVK_URL:-https://github.com/doitsujin/dxvk/releases/download/v${DXVK_VERSION}/dxvk-${DXVK_VERSION}.tar.gz}"
+VKD3D_ENABLED="${VKD3D_ENABLED:-auto}"
+VKD3D_VERSION="${VKD3D_VERSION:-2.14}"
+VKD3D_URL="${VKD3D_URL:-https://github.com/lutris/vkd3d/releases/download/v${VKD3D_VERSION}/vkd3d-${VKD3D_VERSION}.tar.xz}"
+D3D_EXTRAS_ENABLED="${D3D_EXTRAS_ENABLED:-1}"
+D3D_EXTRAS_VERSION="${D3D_EXTRAS_VERSION:-v2}"
+D3D_EXTRAS_URL="${D3D_EXTRAS_URL:-https://github.com/lutris/d3d_extras/releases/download/${D3D_EXTRAS_VERSION}/${D3D_EXTRAS_VERSION}.tar.xz}"
 WEBVIEW2_RENDERER_LIMIT="${WEBVIEW2_RENDERER_LIMIT:-4}"
 
 SYSTEM_INSTALL="${SYSTEM_INSTALL:-1}"   # 1 => /usr/local,/usr/share,/etc ; 0 => ~/.local,~/.config
 ASSUME_YES="${ASSUME_YES:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 LAUNCHER_ONLY="${LAUNCHER_ONLY:-0}"
+FRESH_INSTALL="${FRESH_INSTALL:-0}"
+REMOVE_INSTALL="${REMOVE_INSTALL:-0}"
 CACHE_DIR="${CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/byond-installer}"
 
 # ---------------------------------------------------------------------------
@@ -86,22 +112,119 @@ warn() { printf '%s[warn]%s %s\n'  "$c_yel"  "$c_off" "$*" >&2; }
 die()  { printf '%s[error]%s %s\n' "$c_red"  "$c_off" "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 
+ACTIVE_CHILD_PID=""
+ACTIVE_PART_FILE=""
+ACTIVE_TEMP_FILE=""
+CACHE_CLEANUP_PATH=""
+PREFIX_CLEANUP_PATH=""
+CLEANUP_DONE=0
+
+cleanup_temporary_files() {
+  [ "$CLEANUP_DONE" = "1" ] && return 0
+  CLEANUP_DONE=1
+  if [ -n "$ACTIVE_PART_FILE" ]; then
+    rm -f -- "$ACTIVE_PART_FILE" || warn "could not remove partial download: $ACTIVE_PART_FILE"
+    ACTIVE_PART_FILE=""
+  fi
+  if [ -n "$ACTIVE_TEMP_FILE" ]; then
+    rm -f -- "$ACTIVE_TEMP_FILE" || warn "could not remove temporary file: $ACTIVE_TEMP_FILE"
+    ACTIVE_TEMP_FILE=""
+  fi
+}
+
+paths_overlap() {
+  local first="${1%/}" second="${2%/}"
+  [ -n "$first" ] || first="/"
+  [ -n "$second" ] || second="/"
+  [ "$first" != "/" ] && [ "$second" != "/" ] || return 0
+  [ "$first" = "$second" ] && return 0
+  case "$first/" in "$second/"*) return 0 ;; esac
+  case "$second/" in "$first/"*) return 0 ;; esac
+  return 1
+}
+
+safe_interrupt_cleanup_path() {
+  local path="$1" home_path script_path protected
+  [ "$path" != "/" ] || return 1
+  home_path="$(readlink -m -- "$HOME")" || return 1
+  script_path="$(cd -- "$(dirname -- "$0")" && pwd -P)" || return 1
+  [ "$path" != "$home_path" ] || return 1
+  case "$home_path/" in "$path/"*) return 1 ;; esac
+  case "$script_path/" in "$path/"*) return 1 ;; esac
+  case "$path/" in "$script_path/"*) return 1 ;; esac
+
+  for protected in /usr /etc /var /bin /sbin /lib /lib64 /boot /dev /proc /sys /run; do
+    [ "$path" != "$protected" ] || return 1
+    case "$protected/" in "$path/"*) return 1 ;; esac
+    case "$path/" in "$protected/"*) return 1 ;; esac
+  done
+  for protected in /tmp /home /root /mnt /media /opt /srv; do
+    [ "$path" != "$protected" ] || return 1
+    case "$protected/" in "$path/"*) return 1 ;; esac
+  done
+  return 0
+}
+
+cleanup_created_directories() {
+  local path
+  for path in "$PREFIX_CLEANUP_PATH" "$CACHE_CLEANUP_PATH"; do
+    [ -n "$path" ] || continue
+    if [ -L "$path" ]; then
+      warn "preserving cleanup path that became a symlink: $path"
+    elif [ -d "$path" ]; then
+      log "removing installer-created directory: $path"
+      rm -rf -- "$path" || warn "could not remove installer-created directory: $path"
+    fi
+  done
+  PREFIX_CLEANUP_PATH=""
+  CACHE_CLEANUP_PATH=""
+}
+
+handle_interrupt() {
+  local signal="$1" status="$2" child="${ACTIVE_CHILD_PID:-}"
+  trap '' INT TERM
+  if [ -n "$child" ]; then
+    kill -TERM "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+    ACTIVE_CHILD_PID=""
+  fi
+  warn "received $signal; stopping installer"
+  cleanup_temporary_files
+  cleanup_created_directories
+  exit "$status"
+}
+
+run_child() {
+  "$@" &
+  ACTIVE_CHILD_PID=$!
+  local status=0
+  wait "$ACTIVE_CHILD_PID" || status=$?
+  ACTIVE_CHILD_PID=""
+  return "$status"
+}
+
+trap cleanup_temporary_files EXIT
+trap 'handle_interrupt INT 130' INT
+trap 'handle_interrupt TERM 143' TERM
+
 usage() { awk 'NR<=2{next} /^# ={10,}$/{exit} {sub(/^# ?/,""); print}' "$0"; exit 0; }
 
 first_file() { for f in "$@"; do [ -n "$f" ] && [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }; done; return 1; }
 
 wine_run() {
   WINEPREFIX="$PREFIX" WINEARCH=win64 WINEDEBUG="${WINEDEBUG:--all}" \
-    "$WINE_BIN" "$@"
+    run_child "$WINE_BIN" "$@"
 }
 
 download() { # download <url> <dest-file>
-  local url="$1" dest="$2"
+  local url="$1" dest="$2" part="${2}.part"
   if [ -s "$dest" ]; then log "using cached $(basename "$dest")"; return 0; fi
   log "downloading $(basename "$dest")"
-  curl -fL --retry 3 --connect-timeout 20 --max-time 900 -o "$dest.part" "$url" \
-    || { rm -f "$dest.part"; die "download failed: $url"; }
-  mv -f "$dest.part" "$dest"
+  ACTIVE_PART_FILE="$part"
+  run_child curl -fL --retry 3 --connect-timeout 20 --max-time 900 -o "$part" "$url" \
+    || die "download failed: $url"
+  mv -f "$part" "$dest" || die "could not save download: $dest"
+  ACTIVE_PART_FILE=""
 }
 
 have_passwordless_sudo() { sudo -n true >/dev/null 2>&1; }
@@ -116,11 +239,309 @@ confirm() { # confirm <prompt>
 place() { # place <src> <dest-abs> <mode> <0|1 use_sudo>
   local src="$1" dest="$2" mode="$3" use_sudo="${4:-0}"
   if [ "$use_sudo" = "1" ]; then
-    sudo install -Dm"$mode" "$src" "$dest"
+    run_child sudo install -Dm"$mode" "$src" "$dest"
   else
     mkdir -p "$(dirname "$dest")"
-    install -m"$mode" "$src" "$dest"
+    run_child install -m"$mode" "$src" "$dest"
   fi
+}
+
+fresh_prefix() {
+  [ "$FRESH_INSTALL" = "1" ] || return 0
+  [ "$LAUNCHER_ONLY" != "1" ] || die "--fresh cannot be used with --launcher-only"
+
+  need readlink
+  need date
+  local resolved_prefix resolved_home resolved_cache script_dir backup_path backup_stamp
+  resolved_prefix="$(readlink -m -- "$PREFIX")" || die "could not resolve prefix path"
+  resolved_home="$(readlink -m -- "$HOME")" || die "could not resolve home path"
+  resolved_cache="$(readlink -m -- "$CACHE_DIR")" || die "could not resolve cache path"
+  script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)" || die "could not resolve installer directory"
+
+  if [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; then
+    [ -d "$PREFIX" ] || die "existing prefix is not a directory: $PREFIX"
+    [ "$resolved_prefix" != "/" ] || die "refusing to fresh-install the root directory"
+    [ "$resolved_prefix" != "$resolved_home" ] || die "refusing to fresh-install the home directory"
+    case "$resolved_home/" in
+      "$resolved_prefix/"*) die "refusing to move a directory containing the home directory" ;;
+    esac
+    case "$script_dir/" in
+      "$resolved_prefix/"*) die "refusing to move a directory containing the installer" ;;
+    esac
+    case "$resolved_prefix/" in
+      "$script_dir/"*) die "refusing to move a prefix inside the installer directory" ;;
+    esac
+  else
+    log "fresh install requested; no existing prefix to back up"
+  fi
+
+  [ "$resolved_cache" != "/" ] || die "refusing to clear the root directory as installer cache"
+  [ "$resolved_cache" != "$resolved_home" ] || die "refusing to clear the home directory as installer cache"
+  case "$resolved_home/" in
+    "$resolved_cache/"*) die "refusing to clear a cache directory containing the home directory" ;;
+  esac
+  case "$resolved_prefix/" in
+    "$resolved_cache/"*) die "refusing to clear a cache directory containing the prefix" ;;
+  esac
+  case "$resolved_cache/" in
+    "$resolved_prefix/"*) die "refusing to clear a cache directory inside the prefix" ;;
+  esac
+  case "$script_dir/" in
+    "$resolved_cache/"*) die "refusing to clear a cache directory containing the installer" ;;
+  esac
+  case "$resolved_cache/" in
+    "$script_dir/"*) die "refusing to clear a cache directory inside the installer directory" ;;
+  esac
+
+  if [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; then
+    backup_stamp="$(date '+%Y%m%d-%H%M%S')" || die "could not create backup timestamp"
+    backup_path="${PREFIX}.backup-${backup_stamp}"
+    if [ -e "$backup_path" ] || [ -L "$backup_path" ]; then
+      backup_path="${backup_path}-$$"
+    fi
+    [ ! -e "$backup_path" ] && [ ! -L "$backup_path" ] \
+      || die "prefix backup path already exists: $backup_path"
+    mv -T -- "$PREFIX" "$backup_path" || die "could not back up existing prefix to $backup_path"
+    log "existing prefix moved to backup: $backup_path"
+  fi
+
+  log "clearing installer cache: $resolved_cache"
+  rm -rf -- "$resolved_cache" || die "could not clear installer cache: $resolved_cache"
+  mkdir -p -- "$resolved_cache" || die "could not recreate installer cache: $resolved_cache"
+}
+
+remove_file() { # remove_file <path> [system]
+  local path="$1" system="${2:-0}"
+  [ -e "$path" ] || [ -L "$path" ] || return 0
+  if [ "$system" = "1" ] && [ "$EUID" -ne 0 ]; then
+    need sudo
+    sudo rm -f -- "$path" || die "could not remove $path"
+  else
+    rm -f -- "$path" || die "could not remove $path"
+  fi
+  log "removed $path"
+}
+
+remove_empty_dir() { # remove_empty_dir <path> [system]
+  local path="$1" system="${2:-0}" contents
+  [ -d "$path" ] && [ ! -L "$path" ] || return 0
+  if [ "$system" = "1" ]; then
+    if [ "$EUID" -eq 0 ]; then
+      rmdir --ignore-fail-on-non-empty -- "$path" || die "could not remove empty directory: $path"
+    else
+      need sudo
+      sudo rmdir --ignore-fail-on-non-empty -- "$path" \
+        || die "could not remove empty directory: $path"
+    fi
+    return 0
+  fi
+  contents="$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)" \
+    || die "could not inspect directory: $path"
+  [ -z "$contents" ] || return 0
+  rmdir -- "$path" || die "could not remove empty directory: $path"
+}
+
+refuse_system_tree() { # refuse_system_tree <resolved-path> <label>
+  local path="$1" label="$2" protected
+  for protected in /usr /etc /var /bin /sbin /lib /lib64 /boot /dev /proc /sys /run; do
+    [ "$path" != "$protected" ] \
+      || die "refusing to remove $protected as $label"
+    case "$protected/" in
+      "$path/"*) die "refusing to remove a path containing protected directory $protected" ;;
+    esac
+    case "$path/" in
+      "$protected/"*) die "refusing to remove $label inside protected directory $protected" ;;
+    esac
+  done
+  for protected in /tmp /home /root /mnt /media /opt /srv; do
+    [ "$path" != "$protected" ] \
+      || die "refusing to remove $protected as $label"
+    case "$protected/" in
+      "$path/"*) die "refusing to remove a path containing protected directory $protected" ;;
+    esac
+  done
+}
+
+remove_mime_association() {
+  local mimeapps="${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list" tmp
+  [ -f "$mimeapps" ] || return 0
+  [ ! -L "$mimeapps" ] || die "refusing to replace symlinked MIME configuration: $mimeapps"
+
+  tmp="$(mktemp "${mimeapps}.byond-remove.XXXXXX")" \
+    || die "could not create temporary MIME configuration"
+  ACTIVE_TEMP_FILE="$tmp"
+  if ! awk '
+    function remove_byond(value, count, ids, i, result, found) {
+      count = split(value, ids, ";")
+      for (i = 1; i <= count; i++) {
+        if (ids[i] == "byond.desktop" || ids[i] == "byond-url-handler.desktop")
+          found = 1
+      }
+      if (!found)
+        return value
+      for (i = 1; i <= count; i++) {
+        if (ids[i] != "" && ids[i] != "byond.desktop" && ids[i] != "byond-url-handler.desktop")
+          result = result ids[i] ";"
+      }
+      return result
+    }
+    /^\[/ { section = $0; print; next }
+    section == "[Default Applications]" || section == "[Added Associations]" {
+      separator = index($0, "=")
+      if (separator && substr($0, 1, separator - 1) == "x-scheme-handler/byond") {
+        key = substr($0, 1, separator - 1)
+        value = remove_byond(substr($0, separator + 1))
+        if (value != "")
+          print key "=" value
+        next
+      }
+    }
+    { print }
+  ' "$mimeapps" > "$tmp"; then
+    rm -f -- "$tmp"
+    die "could not update MIME configuration: $mimeapps"
+  fi
+
+  if cmp -s -- "$mimeapps" "$tmp"; then
+    rm -f -- "$tmp"
+  else
+    chmod --reference="$mimeapps" "$tmp" || {
+      rm -f -- "$tmp"
+      ACTIVE_TEMP_FILE=""
+      die "could not preserve permissions for $mimeapps"
+    }
+    mv -f -- "$tmp" "$mimeapps" || {
+      rm -f -- "$tmp"
+      ACTIVE_TEMP_FILE=""
+      die "could not update MIME configuration: $mimeapps"
+    }
+    log "removed BYOND URL association from $mimeapps"
+  fi
+  ACTIVE_TEMP_FILE=""
+}
+
+remove_installation() {
+  [ "$FRESH_INSTALL" != "1" ] || die "--remove cannot be combined with --fresh"
+  [ "$DRY_RUN" != "1" ] || die "--remove cannot be combined with --dry-run"
+  [ "$LAUNCHER_ONLY" != "1" ] || die "--remove cannot be combined with --launcher-only"
+
+  need readlink
+  need awk
+  need cmp
+  need mktemp
+  need find
+  local resolved_prefix resolved_cache resolved_home script_dir
+  local user_config user_launcher user_desktop apps_user mimeapps
+  local backup backup_suffix
+  resolved_prefix="$(readlink -m -- "$PREFIX")" || die "could not resolve prefix path"
+  resolved_cache="$(readlink -m -- "$CACHE_DIR")" || die "could not resolve cache path"
+  resolved_home="$(readlink -m -- "$HOME")" || die "could not resolve home path"
+  script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)" || die "could not resolve installer directory"
+
+  [ "$resolved_prefix" != "/" ] || die "refusing to remove the root directory as prefix"
+  [ "$resolved_prefix" != "$resolved_home" ] || die "refusing to remove the home directory as prefix"
+  refuse_system_tree "$resolved_prefix" prefix
+  case "$resolved_home/" in
+    "$resolved_prefix/"*) die "refusing to remove a prefix containing the home directory" ;;
+  esac
+  case "$script_dir/" in
+    "$resolved_prefix/"*) die "refusing to remove a prefix containing the installer" ;;
+  esac
+  case "$resolved_prefix/" in
+    "$script_dir/"*) die "refusing to remove a prefix inside the installer directory" ;;
+  esac
+  [ ! -L "$PREFIX" ] || die "refusing to remove a symlinked prefix: $PREFIX"
+  if [ -e "$PREFIX" ] && [ ! -d "$PREFIX" ]; then
+    die "prefix exists but is not a directory: $PREFIX"
+  fi
+
+  [ "$resolved_cache" != "/" ] || die "refusing to remove the root directory as installer cache"
+  [ "$resolved_cache" != "$resolved_home" ] || die "refusing to remove the home directory as installer cache"
+  refuse_system_tree "$resolved_cache" cache
+  case "$resolved_home/" in
+    "$resolved_cache/"*) die "refusing to remove a cache containing the home directory" ;;
+  esac
+  case "$resolved_prefix/" in
+    "$resolved_cache/"*) die "refusing to remove a cache containing the prefix" ;;
+  esac
+  case "$resolved_cache/" in
+    "$resolved_prefix/"*) die "refusing to remove a cache inside the prefix" ;;
+  esac
+  case "$script_dir/" in
+    "$resolved_cache/"*) die "refusing to remove a cache containing the installer" ;;
+  esac
+  case "$resolved_cache/" in
+    "$script_dir/"*) die "refusing to remove a cache inside the installer directory" ;;
+  esac
+  [ ! -L "$CACHE_DIR" ] || die "refusing to remove a symlinked cache: $CACHE_DIR"
+  if [ -e "$CACHE_DIR" ] && [ ! -d "$CACHE_DIR" ]; then
+    die "cache path exists but is not a directory: $CACHE_DIR"
+  fi
+
+  user_config="${XDG_CONFIG_HOME:-$HOME/.config}/byond/byond-launch.conf"
+  user_launcher="${BIN_DIR:-$HOME/.local/bin}/byond-launcher"
+  apps_user="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  user_desktop="$apps_user/byond.desktop"
+  mimeapps="${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list"
+  [ ! -L "$mimeapps" ] || die "refusing to replace symlinked MIME configuration: $mimeapps"
+
+  log "Removal will permanently delete:"
+  log "  prefix and timestamped backups: $PREFIX"
+  log "  installer cache: $CACHE_DIR"
+  log "  user launcher/config/desktop (BYOND machine identity is preserved)"
+  log "  system launcher/config/desktop (if present; may require sudo)"
+  log "  BYOND URL-handler registration"
+  confirm "Continue with complete BYOND removal?" || {
+    log "removal cancelled"
+    return 0
+  }
+
+  if [ -e "$PREFIX" ]; then
+    rm -rf -- "$PREFIX" || die "could not remove prefix: $PREFIX"
+    log "removed prefix $PREFIX"
+  fi
+  for backup in "${PREFIX}.backup-"*; do
+    [ -e "$backup" ] || [ -L "$backup" ] || continue
+    backup_suffix="${backup#"${PREFIX}.backup-"}"
+    [[ "$backup_suffix" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || continue
+    rm -rf -- "$backup" || die "could not remove prefix backup: $backup"
+    log "removed prefix backup $backup"
+  done
+  if [ -e "$CACHE_DIR" ]; then
+    rm -rf -- "$CACHE_DIR" || die "could not remove installer cache: $CACHE_DIR"
+    log "removed installer cache $CACHE_DIR"
+  fi
+
+  remove_file "$user_config"
+  remove_file "$user_launcher"
+  remove_file "$user_desktop"
+  remove_file "$apps_user/byond-url-handler.desktop"
+  remove_mime_association
+
+  remove_file "/etc/byond/byond-launch.conf" 1
+  remove_file "/usr/local/bin/byond-launcher" 1
+  remove_file "/usr/share/applications/byond.desktop" 1
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    if [ -d "$apps_user" ]; then
+      update-desktop-database "$apps_user" \
+        || warn "could not refresh user desktop database"
+    fi
+    if [ -d /usr/share/applications ]; then
+      if [ "$EUID" -eq 0 ]; then
+        update-desktop-database /usr/share/applications \
+          || warn "could not refresh system desktop database"
+      elif command -v sudo >/dev/null 2>&1; then
+        sudo update-desktop-database /usr/share/applications \
+          || warn "could not refresh system desktop database"
+      fi
+    fi
+  fi
+  remove_empty_dir "${XDG_CONFIG_HOME:-$HOME/.config}/byond"
+  remove_empty_dir "${XDG_DATA_HOME:-$HOME/.local/share}/.byond-wine"
+  remove_empty_dir "$(dirname -- "$PREFIX")"
+  remove_empty_dir /etc/byond 1
+  log "BYOND removal complete"
 }
 
 # ---------------------------------------------------------------------------
@@ -130,17 +551,30 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help)            usage ;;
     --prefix)             PREFIX="$2"; shift 2 ;;
+    --fresh)              FRESH_INSTALL=1; shift ;;
+    --remove)             REMOVE_INSTALL=1; shift ;;
     --wine)               WINE_BIN="$2"; shift 2 ;;
     --byond-version)      BYOND_VERSION="$2"; shift 2 ;;
-    --byond-url)          BYOND_URL="$2"; shift 2 ;;
+    --byond-url)          BYOND_URL="$2"; BYOND_URL_CUSTOM=1; shift 2 ;;
     --no-dxvk)            DXVK_ENABLED=0; shift ;;
+    --no-vkd3d)           VKD3D_ENABLED=0; shift ;;
+    --vkd3d-version)      VKD3D_VERSION="$2"; shift 2
+                          VKD3D_URL="https://github.com/lutris/vkd3d/releases/download/v${VKD3D_VERSION}/vkd3d-${VKD3D_VERSION}.tar.xz" ;;
+    --no-d3d-extras)      D3D_EXTRAS_ENABLED=0; shift ;;
+    --d3d-extras-version) D3D_EXTRAS_VERSION="$2"; shift 2
+                          D3D_EXTRAS_URL="https://github.com/lutris/d3d_extras/releases/download/${D3D_EXTRAS_VERSION}/${D3D_EXTRAS_VERSION}.tar.xz" ;;
     --no-font-patch)      FONT_PATCH=0; shift ;;
+    --no-watchdog)        SPACE_WATCHDOG_ENABLED=0; shift ;;
     --math-font)          MATH_FONT="$2"; shift 2 ;;
     --symbola-url)          SYMBOLA_URL="$2"; shift 2 ;;
     --renderer-limit)     WEBVIEW2_RENDERER_LIMIT="$2"; shift 2 ;;
     --repo-base)          REPO_BASE="$2"; shift 2
                           SMOFONT_URL="${REPO_BASE}/extra/fonts/smalle.zip"
-                          NTID_URL="${REPO_BASE}/extra/NT-ID.sh" ;;
+                          NTID_URL="${REPO_BASE}/extra/NT-ID.sh"
+                          SPACE_HANDLER_URL="${REPO_BASE}/extra/space-handler.sh"
+                          FONT_PATCH_SCRIPT_URL="${REPO_BASE}/extra/byond-font-patch.py"
+                          SPACE_WATCHDOG_URL="${REPO_BASE}/extra/space-watchdog.sh"
+                          ;;
     --user)               SYSTEM_INSTALL=0; shift ;;
     --system)             SYSTEM_INSTALL=1; shift ;;
     --yes)                ASSUME_YES=1; shift ;;
@@ -150,8 +584,42 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+case "$SPACE_WATCHDOG_ENABLED" in
+  0|1) ;;
+  *) die "SPACE_WATCHDOG_ENABLED must be 0 or 1" ;;
+esac
+
+if [ "$VKD3D_ENABLED" = "auto" ]; then
+  VKD3D_ENABLED="$DXVK_ENABLED"
+fi
+case "$VKD3D_ENABLED" in
+  0|1) ;;
+  *) die "VKD3D_ENABLED must be 0, 1, or auto" ;;
+esac
+if [ "$DXVK_ENABLED" != "1" ]; then
+  VKD3D_ENABLED=0
+fi
+
 export PREFIX WINE_BIN
-PREFIX="${PREFIX%/}"
+if [ "$PREFIX" != "/" ]; then PREFIX="${PREFIX%/}"; fi
+[ -n "$PREFIX" ] || die "prefix cannot be empty"
+[ "$PREFIX" != "/" ] || die "prefix cannot be /"
+[ "$FRESH_INSTALL" != "1" ] || [ "$LAUNCHER_ONLY" != "1" ] \
+  || die "--fresh cannot be used with --launcher-only"
+
+if [ "$REMOVE_INSTALL" = "1" ]; then
+  remove_installation
+  exit 0
+fi
+
+if [ "$BYOND_URL_CUSTOM" = "0" ]; then
+  BYOND_BUILD_SERIES="${BYOND_VERSION%%.*}"
+  BYOND_BUILD_NUMBER="${BYOND_VERSION#*.}"
+  [ "$BYOND_BUILD_SERIES" != "$BYOND_VERSION" ] && [ -n "$BYOND_BUILD_SERIES" ] \
+    && [ -n "$BYOND_BUILD_NUMBER" ] \
+    || die "BYOND version must include a build series and build number, such as 516.1667"
+  BYOND_URL="https://www.byond.com/download/build/${BYOND_BUILD_SERIES}/${BYOND_VERSION}_byond.exe"
+fi
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -161,10 +629,23 @@ log "  wine        : $WINE_BIN"
 log "  prefix      : $PREFIX"
 log "  BYOND       : $BYOND_VERSION"
 log "  DXVK        : $DXVK_ENABLED (v$DXVK_VERSION)"
+log "  VKD3D       : $VKD3D_ENABLED (v$VKD3D_VERSION)"
+log "  D3D Extras  : $D3D_EXTRAS_ENABLED ($D3D_EXTRAS_VERSION)"
 log "  repo base   : $REPO_BASE"
+log "  fresh       : $FRESH_INSTALL"
 
 need "$WINE_BIN"
 need winetricks; need curl; need unzip; need tar; need sha256sum
+if [ "$VKD3D_ENABLED" = "1" ] || [ "$D3D_EXTRAS_ENABLED" = "1" ]; then need xz; fi
+if [ ! -e "$CACHE_DIR" ] && [ ! -L "$CACHE_DIR" ]; then
+  need readlink
+  cache_candidate="$(readlink -m -- "$CACHE_DIR")" || die "could not resolve cache path"
+  prefix_candidate="$(readlink -m -- "$PREFIX")" || die "could not resolve prefix path"
+  if safe_interrupt_cleanup_path "$cache_candidate" \
+      && ! paths_overlap "$cache_candidate" "$prefix_candidate"; then
+    CACHE_CLEANUP_PATH="$cache_candidate"
+  fi
+fi
 mkdir -p "$CACHE_DIR"
 
 "$WINE_BIN" --version >/dev/null 2>&1 || die "wine binary not runnable: $WINE_BIN"
@@ -174,10 +655,30 @@ log "detected wine: $wine_ver (need >= 10.8, 11.x recommended)"
 # ---------------------------------------------------------------------------
 # Artifact generation (config + launcher + desktop entry)
 # ---------------------------------------------------------------------------
+dll_override_names=()
 if [ "$DXVK_ENABLED" = "1" ]; then
-  dll_overrides='d3d10core,d3d11,d3d12,dxgi=n'
-else
-  dll_overrides=''
+  dll_override_names+=(d3d10core d3d11 dxgi)
+fi
+if [ "$VKD3D_ENABLED" = "1" ]; then
+  dll_override_names+=(d3d12 d3d12core)
+fi
+if [ "$D3D_EXTRAS_ENABLED" = "1" ]; then
+  dll_override_names+=(
+    d3dx10_33 d3dx10_34 d3dx10_35 d3dx10_36 d3dx10_37 d3dx10_38
+    d3dx10_39 d3dx10_40 d3dx10_41 d3dx10_42 d3dx10_43 d3dx10
+    d3dx11_42 d3dx11_43
+    d3dx9_24 d3dx9_25 d3dx9_26 d3dx9_27 d3dx9_28 d3dx9_29 d3dx9_30
+    d3dx9_31 d3dx9_32 d3dx9_33 d3dx9_34 d3dx9_35 d3dx9_36 d3dx9_37
+    d3dx9_38 d3dx9_39 d3dx9_40 d3dx9_41 d3dx9_42 d3dx9_43
+    d3dcompiler_33 d3dcompiler_34 d3dcompiler_35 d3dcompiler_36
+    d3dcompiler_37 d3dcompiler_38 d3dcompiler_39 d3dcompiler_40
+    d3dcompiler_41 d3dcompiler_42 d3dcompiler_43 d3dcompiler_46
+    d3dcompiler_47
+  )
+fi
+dll_overrides=""
+if [ "${#dll_override_names[@]}" -gt 0 ]; then
+  dll_overrides="$(IFS=,; printf '%s' "${dll_override_names[*]}")=n"
 fi
 
 gen_artifacts() { # gen_artifacts <outdir>
@@ -197,7 +698,7 @@ WINEPREFIX="$PREFIX"
 # The BYOND executable, as a Windows path.
 GAME_EXE='C:\\Program Files (x86)\\BYOND\\bin\\byond.exe'
 
-# DLL overrides (DXVK). Leave empty to use Wine's built-in wined3d.
+# DLL overrides for the enabled DXVK, VKD3D, and D3D Extras components.
 WINEDLLOVERRIDES="$dll_overrides"
 
 # Environment (matches a fast, well-behaved configuration).
@@ -209,6 +710,9 @@ WINE_LARGE_ADDRESS_AWARE="1"
 
 # Extra arguments appended to the wine command.
 GAME_ARGS=""
+
+# Set to 1 to run the installed Space Watchdog with BYOND.
+SPACE_WATCHDOG_ENABLED="$SPACE_WATCHDOG_ENABLED"
 
 # NOTE: do not launch this through a child-subreaper (e.g. Lutris'
 # lutris-wrapper). Chromium/WebView2 hangs when wine is a subreaper.
@@ -237,6 +741,21 @@ if [ -r "$USER_CONF" ]; then . "$USER_CONF"; conf_found=1; fi
 : "${WINEPREFIX:?set WINEPREFIX in $SYSTEM_CONF}"
 : "${GAME_EXE:?set GAME_EXE in $SYSTEM_CONF}"
 
+case "${SPACE_WATCHDOG_ENABLED:-0}" in
+  0) ;;
+  1)
+    watchdog="$WINEPREFIX/space-watchdog.sh"
+    [ -x "$watchdog" ] || {
+      echo "byond-launcher: watchdog is enabled but missing or not executable: $watchdog" >&2
+      exit 1
+    }
+    ;;
+  *)
+    echo "byond-launcher: SPACE_WATCHDOG_ENABLED must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+
 export WINEPREFIX
 [ -n "${WINEARCH:-}" ]            && export WINEARCH
 [ -n "${WINEDLLOVERRIDES:-}" ]    && export WINEDLLOVERRIDES
@@ -250,6 +769,7 @@ export WINEPREFIX
 if [ $# -ge 1 ] && [[ "$1" == *"://"* ]]; then
   handler="$WINEPREFIX/space-handler.sh"
   [ -x "$handler" ] || { echo "byond-launcher: missing $handler" >&2; exit 1; }
+  export BYOND_LAUNCHER="${BYOND_LAUNCHER:-$0}"
   exec "$handler" "$1"
 fi
 
@@ -276,6 +796,10 @@ if [ "${1:-}" = "-url" ] && [ -n "${2:-}" ]; then args+=(-url "$2"); fi
 cleanup_menu
 "$WINE_BIN" "$GAME_EXE" "${args[@]}" &
 game_pid=$!
+if [ "${SPACE_WATCHDOG_ENABLED:-0}" = "1" ]; then
+  # Let the watchdog derive its prefix from the directory where it is installed.
+  env -u WINEPREFIX WINE="$WINE_BIN" "$watchdog" >>"$WINEPREFIX/space-watchdog.log" 2>&1 &
+fi
 trap 'kill -TERM "$game_pid" 2>/dev/null' INT TERM
 rc=0
 wait "$game_pid" || rc=$?
@@ -316,8 +840,17 @@ if [ "$LAUNCHER_ONLY" != "1" ]; then
 # ---------------------------------------------------------------------------
 log "creating/updating win64 prefix"
 export WINEPREFIX="$PREFIX" WINEARCH=win64
+fresh_prefix
+if [ ! -e "$PREFIX" ] && [ ! -L "$PREFIX" ]; then
+  prefix_candidate="$(readlink -m -- "$PREFIX")" || die "could not resolve prefix path"
+  cache_candidate="$(readlink -m -- "$CACHE_DIR")" || die "could not resolve cache path"
+  if safe_interrupt_cleanup_path "$prefix_candidate" \
+      && ! paths_overlap "$prefix_candidate" "$cache_candidate"; then
+    PREFIX_CLEANUP_PATH="$prefix_candidate"
+  fi
+fi
 mkdir -p "$(dirname "$PREFIX")"
-"$WINE_BIN" wineboot -u >/dev/null 2>&1 || warn "wineboot returned non-zero (often harmless)"
+run_child "$WINE_BIN" wineboot -u >/dev/null 2>&1 || warn "wineboot returned non-zero (often harmless)"
 [ -d "$PREFIX/drive_c" ] || die "prefix was not created at $PREFIX"
 
 # ---------------------------------------------------------------------------
@@ -326,7 +859,7 @@ mkdir -p "$(dirname "$PREFIX")"
 if [ ! -f "$PREFIX/winetricks.log" ] || ! grep -qx 'msftedit' "$PREFIX/winetricks.log" 2>/dev/null; then
   log "installing winetricks verbs (vcrun2022 dxtrans corefonts riched20 msftedit)"
   WINE="$WINE_BIN" WINEPREFIX="$PREFIX" WINEARCH=win64 WINEDEBUG=-all \
-    winetricks -q vcrun2022 dxtrans corefonts riched20 msftedit \
+    run_child winetricks -q vcrun2022 dxtrans corefonts riched20 msftedit \
     || warn "winetricks reported errors - check output if things misbehave"
 else
   log "winetricks verbs already present"
@@ -354,7 +887,7 @@ bash "$CACHE_DIR/NT-ID.sh" "$PREFIX" || warn "NT-ID step failed"
 # ---------------------------------------------------------------------------
 log "installing WebView2 runtime (this can take a few minutes)"
 download "$WEBVIEW2_URL" "$CACHE_DIR/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
-wine_run "$CACHE_DIR/MicrosoftEdgeWebView2RuntimeInstallerX64.exe" /silent /install >/dev/null 2>&1 \
+wine_run "$CACHE_DIR/MicrosoftEdgeWebView2RuntimeInstallerX64.exe" /install >/dev/null 2>&1 \
   || warn "WebView2 installer returned non-zero (often harmless)"
 wine_run taskkill /f /im MicrosoftEdgeUpdate.exe >/dev/null 2>&1 || true
 
@@ -398,6 +931,36 @@ if [ "$DXVK_ENABLED" = "1" ]; then
   cp -f --remove-destination "$dxvk_root/x32/"*.dll "$PREFIX/drive_c/windows/syswow64/"
 fi
 
+if [ "$VKD3D_ENABLED" = "1" ]; then
+  log "installing VKD3D v$VKD3D_VERSION"
+  vkd3d_archive="$CACHE_DIR/vkd3d-${VKD3D_VERSION}.tar.xz"
+  download "$VKD3D_URL" "$vkd3d_archive"
+  rm -rf "$CACHE_DIR/vkd3d"
+  mkdir -p "$CACHE_DIR/vkd3d"
+  tar -xJf "$vkd3d_archive" -C "$CACHE_DIR/vkd3d"
+  vkd3d_root="$CACHE_DIR/vkd3d/vkd3d-${VKD3D_VERSION}"
+  [ -f "$vkd3d_root/x64/d3d12.dll" ] && [ -f "$vkd3d_root/x64/d3d12core.dll" ] \
+    && [ -f "$vkd3d_root/x86/d3d12.dll" ] && [ -f "$vkd3d_root/x86/d3d12core.dll" ] \
+    || die "VKD3D archive has an unexpected layout"
+  cp -f --remove-destination "$vkd3d_root/x64/"*.dll "$PREFIX/drive_c/windows/system32/"
+  cp -f --remove-destination "$vkd3d_root/x86/"*.dll "$PREFIX/drive_c/windows/syswow64/"
+fi
+
+if [ "$D3D_EXTRAS_ENABLED" = "1" ]; then
+  log "installing D3D Extras $D3D_EXTRAS_VERSION"
+  d3d_extras_archive="$CACHE_DIR/d3d-extras-${D3D_EXTRAS_VERSION}.tar.xz"
+  download "$D3D_EXTRAS_URL" "$d3d_extras_archive"
+  rm -rf "$CACHE_DIR/d3d-extras"
+  mkdir -p "$CACHE_DIR/d3d-extras"
+  tar -xJf "$d3d_extras_archive" -C "$CACHE_DIR/d3d-extras"
+  d3d_extras_root="$CACHE_DIR/d3d-extras/$D3D_EXTRAS_VERSION"
+  [ -f "$d3d_extras_root/x64/d3dcompiler_47.dll" ] \
+    && [ -f "$d3d_extras_root/x32/d3dcompiler_47.dll" ] \
+    || die "D3D Extras archive has an unexpected layout"
+  cp -f --remove-destination "$d3d_extras_root/x64/"*.dll "$PREFIX/drive_c/windows/system32/"
+  cp -f --remove-destination "$d3d_extras_root/x32/"*.dll "$PREFIX/drive_c/windows/syswow64/"
+fi
+
 # ---------------------------------------------------------------------------
 # 10. BYOND-packaged DirectX
 # ---------------------------------------------------------------------------
@@ -412,496 +975,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3b. Glyph patch: merge hieroglyph / emoji / runic / math outlines into the
-#     four fonts WebView2 actually uses. WebView2 under Wine ignores host
-#     fontconfig and fonts merely copied into C:\windows\Fonts, so the outlines
-#     must live inside arial/times/tahoma/micross. Also replaces Proton font
-#     symlinks with regular files (never writes through them).
+# 3b. Prepare glyph source fonts and invoke the shared font-patch script.
+#     The helper handles merging, backups, symlinks, and verification.
 # ---------------------------------------------------------------------------
-install_font_patch_script() {
-  cat > "$CACHE_DIR/byond-font-patch.py" <<'BYOND_FONT_PATCH'
-#!/usr/bin/env python3
-"""
-byond-font-patch.py - merge missing Unicode glyphs into the four core fonts that
-WebView2/BYOND actually use inside a Wine prefix (arial, times, tahoma, micross),
-so Chromium's font fallback never has to run for them.
-
-Why: WebView2 under Wine ignores Linux fontconfig and (in practice) ignores fonts
-merely installed into C:\\windows\\Fonts. Merging the outlines directly into the
-fonts Chromium already resolves is what works (verified approach).
-
-Important constraints learned the hard way (keep them):
-  * Do NOT use Noto Sans Math outlines - they make Wine/DirectWrite spin at 100%
-    CPU and BYOND never opens its window. Use Symbola (preferred) or another
-    TrueType math font as the math source.
-  * Preserve hinting tables (gasp, cvt, fpgm, prep) and never touch existing
-    glyphs, so normal text keeps its appearance and ASCII advance widths.
-  * Prefix font files are often SYMLINKS into a Proton/Wine runtime. Replacing
-    them with os.replace() replaces the symlink, not the shared runtime file, and
-    originals are copied to backup-originals/ as regular files.
-
-Usage:
-  byond-font-patch.py --prefix ~/Games/byond
-  byond-font-patch.py --prefix ~/Games/byond --verify
-  byond-font-patch.py --prefix ~/Games/byond --revert
-  byond-font-patch.py --prefix ~/Games/byond --chars "𓊈😀ᛣ𝓰"
-  byond-font-patch.py --prefix ~/Games/byond --no-emoji
-"""
-from __future__ import annotations
-
-import argparse
-import os
-import shutil
-import sys
-import tempfile
-
-try:
-    from fontTools.ttLib import TTFont
-    from fontTools.pens.ttGlyphPen import TTGlyphPen
-    from fontTools.pens.transformPen import TransformPen
-    from fontTools.misc.transform import Transform
-    from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
-except ImportError:
-    sys.exit("fontTools is required (python-fonttools / pip install fonttools)")
-
-BASE_FONTS = ["arial", "times", "tahoma", "micross"]
-
-# Codepoint ranges copied from each source font (only cps actually present).
-RANGES = {
-    "egypt": [(0x13000, 0x1342F), (0x13460, 0x143FF)],
-    "runic": [(0x16A0, 0x16FF)],
-    "emoji": [(0x2600, 0x27BF), (0x2B00, 0x2BFF), (0x1F000, 0x1FAFF), (0x1F1E6, 0x1F1FF)],
-    "math": [(0x1D400, 0x1D7FF)],
-}
-
-SEARCH = {
-    "egypt": [
-        os.environ.get("BYOND_EGYPT_FONT", ""),
-        "/usr/share/fonts/noto/NotoSansEgyptianHieroglyphs-Regular.ttf",
-        "/usr/share/fonts/TTF/NotoSansEgyptianHieroglyphs-Regular.ttf",
-    ],
-    "runic": [
-        os.environ.get("BYOND_RUNIC_FONT", ""),
-        "/usr/share/fonts/noto/NotoSansRunic-Regular.ttf",
-        "/usr/share/fonts/TTF/NotoSansRunic-Regular.ttf",
-    ],
-    "emoji": [
-        os.environ.get("BYOND_EMOJI_FONT", ""),
-        "/usr/share/fonts/noto/NotoEmoji-Regular.ttf",
-        "/usr/share/fonts/noto/NotoEmoji-VariableFont_wght.ttf",
-    ],
-    # Symbola first (proven), then other TrueType math fonts. Noto Sans Math is
-    # intentionally NOT in the default list (causes the hang).
-    "math": [
-        os.environ.get("BYOND_MATH_FONT", ""),
-        "/usr/share/fonts/TTF/Symbola.ttf",
-        "/usr/share/fonts/truetype/symbola/Symbola.ttf",
-        "/usr/share/fonts/TTF/DejaVuMathTeXGyre.ttf",
-        "/usr/share/fonts/dejavu/DejaVuMathTeXGyre.ttf",
-    ],
-}
-
-HINT_TABLES = ["gasp", "cvt ", "fpgm", "prep"]
-
-
-def first_existing(paths):
-    for p in paths:
-        if p and os.path.isfile(p):
-            return p
-    return None
-
-
-def ensure_cmap12(base):
-    """Return a Unicode format-12 subtable, creating a complete one if the font
-    only ships BMP (format 4) coverage. Without this, codepoints above U+FFFF
-    (hieroglyphs, emoji, math alphanumerics) are merged but never mapped."""
-    for t in base["cmap"].tables:
-        if t.format in (12, 13) and t.isUnicode():
-            return t
-    full = {}
-    for t in base["cmap"].tables:
-        if t.isUnicode():
-            full.update(t.cmap)
-    sub = CmapSubtable.newSubtable(12)
-    sub.platformID = 3
-    sub.platEncID = 10
-    sub.language = 0
-    sub.format = 12
-    sub.cmap = dict(full)
-    base["cmap"].tables.append(sub)
-    return sub
-
-
-def cp_in_ranges(cp, ranges):
-    return any(lo <= cp <= hi for lo, hi in ranges)
-
-
-def collect_cps(cmap, ranges):
-    return sorted(cp for cp in cmap if cp_in_ranges(cp, ranges))
-
-
-def load_source(path, label):
-    font = TTFont(path, lazy=False, fontNumber=0)
-    if "fvar" in font:
-        try:
-            from fontTools.varLib.instancer import instantiateVariableFont
-            instantiateVariableFont(font, {"wght": 400}, inplace=True)
-            print(f"  {label}: instantiated variable font at wght=400")
-        except Exception as exc:  # keep default instance on failure
-            print(f"  {label}: variable instancing skipped ({exc})")
-    return font
-
-
-def glyph_add(font, name, source_glyph_set, scale, source_hmtx):
-    pen = TTGlyphPen(None)
-    if scale != 1.0:
-        source_glyph_set[name].draw(TransformPen(pen, Transform(scale, 0, 0, scale, 0, 0)))
-    else:
-        source_glyph_set[name].draw(pen)
-    glyph = pen.glyph()
-    advance, lsb = source_hmtx[name]
-    return glyph, (round(advance * scale), round(lsb * scale))
-
-
-def merged_font(base_path, sources, extra_chars):
-    """Return a TTFont with extra glyphs merged in, plus a report dict."""
-    base = TTFont(base_path, lazy=False, fontNumber=0)
-    base_upem = base["head"].unitsPerEm
-    glyf = base["glyf"]
-    hmtx = base["hmtx"]
-
-    order = list(base.getGlyphOrder())
-    cmaps = [t for t in base["cmap"].tables if t.isUnicode()]
-    cmap12 = ensure_cmap12(base)
-    added = {}
-    per_source = {}
-
-    for label, path in sources.items():
-        src = load_source(path, label)
-        s_upem = src["head"].unitsPerEm
-        scale = base_upem / s_upem
-        s_cmap = src.getBestCmap()
-        s_gs = src.getGlyphSet()
-        s_hmtx = src["hmtx"]
-
-        if label == "extra":
-            wanted = [ord(c) for c in extra_chars]
-        else:
-            wanted = collect_cps(s_cmap, RANGES[label])
-
-        count = 0
-        for cp in wanted:
-            if cp not in s_cmap:
-                continue
-            if any(t.cmap.get(cp) for t in cmaps):
-                continue
-            new_name = f"byond{cp:06X}"
-            if new_name in glyf.glyphs:
-                continue
-            try:
-                glyph, metrics = glyph_add(base, s_cmap[cp], s_gs, scale, s_hmtx)
-            except Exception:
-                continue
-            glyf.glyphs[new_name] = glyph
-            hmtx.metrics[new_name] = metrics
-            order.append(new_name)
-            for t in cmaps:
-                if t.format == 4 and cp > 0xFFFF:
-                    continue
-                t.cmap[cp] = new_name
-            cmap12.cmap[cp] = new_name
-            added[cp] = new_name
-            count += 1
-        per_source[label] = count
-        src.close()
-
-    base.setGlyphOrder(order)
-    base["maxp"].numGlyphs = len(order)
-    if "hhea" in base:
-        base["hhea"].numberOfHMetrics = len(hmtx.metrics)
-    if "post" in base and getattr(base["post"], "formatType", 3.0) == 2.0:
-        base["post"].glyphOrder = order
-    if "OS/2" in base:
-        os2 = base["OS/2"]
-        if added:
-            os2.usFirstCharIndex = min([os2.usFirstCharIndex] + [min(added)])
-            os2.usLastCharIndex = max([os2.usLastCharIndex] + [min(0xFFFF, max(added))])
-    # Recompute per-glyph bounds now that glyphs exist.
-    for gname in order:
-        g = glyf.glyphs.get(gname)
-        if g is not None and hasattr(g, "recalcBounds"):
-            g.recalcBounds(glyf)
-    return base, added, per_source
-
-
-def drop_problem_tables(base, err):
-    """fontTools refuses/mangles a few optional tables when glyphs are appended.
-    They are rasteriser hints, not glyph programs; drop one and retry."""
-    msg = str(err)
-    for table, tag in (("hdmx", "hdmx"), ("LTSH", "LTSH"), ("VDMX", "VDMX"), ("PCLT", "PCLT")):
-        if table in msg and tag in base:
-            del base[tag]
-            print(f"    dropped optional table {tag} (incompatible with appended glyphs)")
-            return True
-    for tag in ("hdmx", "LTSH"):
-        if tag in base:
-            del base[tag]
-            print(f"    dropped optional table {tag} (save guard)")
-            return True
-    return False
-
-
-def save_with_retries(font, out_path):
-    for _ in range(4):
-        try:
-            font.save(out_path)
-            return
-        except (KeyError, IndexError, AssertionError, ValueError, struct_error()) as err:
-            if not drop_problem_tables(font, err):
-                raise
-    font.save(out_path)
-
-
-def struct_error():
-    import struct
-    return struct.error
-
-
-def font_dir(prefix):
-    return os.path.join(prefix, "drive_c", "windows", "Fonts")
-
-
-def backup_dir(prefix):
-    return os.path.join(font_dir(prefix), "backup-originals")
-
-
-def discover(overrides):
-    found = {}
-    for label, paths in SEARCH.items():
-        if overrides.get(label) is False:
-            continue
-        chosen = overrides.get(label) or first_existing(paths)
-        if chosen:
-            found[label] = chosen
-    return found
-
-
-def cmd_patch(args):
-    fdir = font_dir(args.prefix)
-    if not os.path.isdir(fdir):
-        sys.exit(f"not a wine prefix (no {fdir})")
-    bdir = backup_dir(args.prefix)
-    os.makedirs(bdir, exist_ok=True)
-
-    sources = discover({
-        "egypt": False if args.no_egypt else args.egypt,
-        "runic": False if args.no_runic else args.runic,
-        "emoji": False if args.no_emoji else args.emoji,
-        "math": False if args.no_math else args.math,
-    })
-    if not sources and not args.chars:
-        sys.exit("no source fonts found; pass --egypt/--runic/--emoji/--math paths")
-
-    print("source fonts:")
-    for label, path in sources.items():
-        print(f"  {label:6} {path}")
-
-    handle_extra = bool(args.chars)
-    targets = args.fonts
-    new_fonts = {}
-    for name in targets:
-        path = os.path.join(fdir, f"{name}.ttf")
-        if not os.path.isfile(path):
-            print(f"  skip {name}: not present")
-            continue
-        backup = os.path.join(bdir, f"{name}.ttf")
-        pristine = backup if os.path.isfile(backup) else path
-        if not os.path.isfile(backup):
-            shutil.copy2(pristine, backup)  # regular file, follows symlink
-            print(f"  backed up {name} -> backup-originals/{name}.ttf")
-
-        srcs = dict(sources)
-        if handle_extra:
-            srcs["extra"] = None  # resolve extra chars across all sources below
-        merged, added, per_source = merged_font_with_extra(
-            pristine, srcs, args.chars if handle_extra else "")
-
-        out = tempfile.NamedTemporaryFile(
-            dir=fdir, prefix=f".{name}.", suffix=".tmp", delete=False)
-        out.close()
-        save_with_retries(merged, out.name)
-        merged.close()
-        os.replace(out.name, path)  # replaces symlink itself, not its target
-        os.chmod(path, 0o644)
-        new_fonts[name] = (path, added, per_source)
-        total = ", ".join(f"{k}={v}" for k, v in per_source.items() if v)
-        print(f"  patched {name}: +{len(added)} glyphs ({total})")
-
-    if not new_fonts:
-        sys.exit("nothing patched")
-
-    if args.verify:
-        ok = verify(args.prefix, new_fonts, args.chars)
-        if not ok:
-            sys.exit(1)
-
-
-def merged_font_with_extra(base_path, sources, extra_chars):
-    """Merge per-source ranges, then optionally resolve arbitrary characters from
-    whichever source provides them."""
-    if "extra" not in sources:
-        return merged_font(base_path, sources, "")
-
-    ordered = [k for k in sources if k != "extra"]
-    real_sources = {k: sources[k] for k in ordered}
-    base, added, per_source = merged_font(base_path, real_sources, "")
-
-    # Extra characters: try every source in turn.
-    extra_fonts = []
-    for label in ordered:
-        try:
-            extra_fonts.append((label, TTFont(real_sources[label], lazy=False, fontNumber=0)))
-        except Exception:
-            pass
-
-    base_upem = base["head"].unitsPerEm
-    glyf = base["glyf"]
-    hmtx = base["hmtx"]
-    cmaps = [t for t in base["cmap"].tables if t.isUnicode()]
-    cmap12 = ensure_cmap12(base)
-    order = list(base.getGlyphOrder())
-    extra_added = 0
-    for ch in extra_chars:
-        cp = ord(ch)
-        if any(t.cmap.get(cp) for t in cmaps):
-            continue
-        for label, src in extra_fonts:
-            s_cmap = src.getBestCmap()
-            if cp not in s_cmap:
-                continue
-            try:
-                glyph, metrics = glyph_add(
-                    base, s_cmap[cp], src.getGlyphSet(),
-                    base_upem / src["head"].unitsPerEm, src["hmtx"])
-            except Exception:
-                continue
-            new_name = f"byond{cp:06X}"
-            glyf.glyphs[new_name] = glyph
-            hmtx.metrics[new_name] = metrics
-            order.append(new_name)
-            for t in cmaps:
-                if t.format == 4 and cp > 0xFFFF:
-                    continue
-                t.cmap[cp] = new_name
-            cmap12.cmap[cp] = new_name
-            added[cp] = new_name
-            extra_added += 1
-            break
-    for _, src in extra_fonts:
-        src.close()
-    per_source["extra"] = extra_added
-    base.setGlyphOrder(order)
-    base["maxp"].numGlyphs = len(order)
-    return base, added, per_source
-
-
-def ascii_widths(font):
-    cmap = font.getBestCmap()
-    hmtx = font["hmtx"]
-    return {
-        cp: hmtx[cmap[cp]][0]
-        for cp in range(0x20, 0x7F)
-        if cp in cmap
-    }
-
-
-def verify(prefix, patched, extra_chars):
-    fdir = font_dir(prefix)
-    bdir = backup_dir(prefix)
-    ok = True
-    checks = {
-        "egypt \U00013288": 0x13288,
-        "emoji \U0001F600": 0x1F600,
-        "runic \u16E3": 0x16E3,
-        "math \U0001D4F0": 0x1D4F0,
-    }
-    for ch in extra_chars or "":
-        checks[f"char {ch!r}"] = ord(ch)
-
-    print("verify:")
-    for name in patched:
-        path = os.path.join(fdir, f"{name}.ttf")
-        backup = os.path.join(bdir, f"{name}.ttf")
-        is_link = os.path.islink(path)
-        f = TTFont(path, lazy=False, fontNumber=0)
-        b = TTFont(backup, lazy=False, fontNumber=0) if os.path.isfile(backup) else None
-        cmap = f.getBestCmap()
-        missing = [label for label, cp in checks.items() if cp not in cmap]
-        ascii_same = True
-        if b is not None:
-            ascii_same = ascii_widths(f) == ascii_widths(b)
-        if b is not None:
-            hint_ok = (set(HINT_TABLES) & set(b.keys())) == (set(HINT_TABLES) & set(f.keys()))
-        else:
-            hint_ok = True
-        status = "ok" if not missing and ascii_same and hint_ok and not is_link else "FAIL"
-        if status == "FAIL":
-            ok = False
-        print(f"  {name:8} {status}  regular_file={not is_link} ascii_widths_same={ascii_same} "
-              f"hinting_tables={hint_ok} missing={missing or 'none'} glyphs={f['maxp'].numGlyphs}")
-        f.close()
-        if b is not None:
-            b.close()
-    return ok
-
-
-def cmd_revert(args):
-    fdir = font_dir(args.prefix)
-    bdir = backup_dir(args.prefix)
-    if not os.path.isdir(bdir):
-        sys.exit(f"no backups at {bdir}")
-    for name in BASE_FONTS:
-        src = os.path.join(bdir, f"{name}.ttf")
-        dst = os.path.join(fdir, f"{name}.ttf")
-        if os.path.isfile(src):
-            tmp = dst + ".revert.tmp"
-            shutil.copy2(src, tmp)
-            os.replace(tmp, dst)
-            print(f"  restored {name}.ttf")
-    print("reverted; restart BYOND")
-
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--prefix", required=True, help="wine prefix, e.g. ~/Games/byond")
-    ap.add_argument("--fonts", default=",".join(BASE_FONTS),
-                    help="comma separated base fonts (default: arial,times,tahoma,micross)")
-    ap.add_argument("--egypt", help="Egyptian hieroglyph source font")
-    ap.add_argument("--runic", help="Runic source font")
-    ap.add_argument("--emoji", help="monochrome emoji source font (TTF outlines)")
-    ap.add_argument("--math", help="math alphanumerics source (Symbola recommended)")
-    ap.add_argument("--no-egypt", action="store_true")
-    ap.add_argument("--no-runic", action="store_true")
-    ap.add_argument("--no-emoji", action="store_true")
-    ap.add_argument("--no-math", action="store_true")
-    ap.add_argument("--chars", default="", help="additional characters to merge, e.g. '𓊈😀'")
-    ap.add_argument("--verify", action="store_true", help="verify glyphs, ASCII widths, hinting")
-    ap.add_argument("--revert", action="store_true", help="restore backup-originals")
-    args = ap.parse_args()
-    args.prefix = os.path.expanduser(args.prefix)
-    args.fonts = [f.strip() for f in args.fonts.split(",") if f.strip()]
-
-    if args.revert:
-        cmd_revert(args)
-    else:
-        cmd_patch(args)
-
-
-if __name__ == "__main__":
-    main()
-BYOND_FONT_PATCH
-}
-
 if [ "$FONT_PATCH" = "1" ]; then
   if pgrep -x byond.exe >/dev/null 2>&1; then
     warn "BYOND is running - skipping font patch (close it and rerun to apply)"
@@ -910,7 +986,7 @@ if [ "$FONT_PATCH" = "1" ]; then
     warn "install it (Arch: sudo pacman -S python-fonttools) and rerun"
   else
     log "patching WebView2 core fonts with hieroglyph/emoji/runic/math glyphs"
-    install_font_patch_script
+    download "$FONT_PATCH_SCRIPT_URL" "$CACHE_DIR/byond-font-patch.py"
     FONTS_CACHE="$CACHE_DIR/fonts"; mkdir -p "$FONTS_CACHE"
 
     egypt_font="$(first_file "$FONTS_CACHE/NotoSansEgyptianHieroglyphs-Regular.ttf" \
@@ -954,89 +1030,23 @@ if [ "$FONT_PATCH" = "1" ]; then
       fi
     fi
     [ -n "$symbola_font" ] && font_args+=(--math "$symbola_font")
-    python3 "$CACHE_DIR/byond-font-patch.py" "${font_args[@]}" \
+    run_child python3 "$CACHE_DIR/byond-font-patch.py" "${font_args[@]}" \
       || warn "font patch failed - BYOND will run but some Unicode may show as boxes"
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# 4. byond:// URL handler (adapted: launches via byond-launcher, not Lutris)
+# 4. byond:// URL handler (shared helper)
 # ---------------------------------------------------------------------------
 log "installing byond:// URL handler"
-cat > "$PREFIX/space-handler.sh" <<'HANDLER'
-#!/usr/bin/env bash
-# Forward a byond:// URL from the host browser to BYOND in this wine prefix.
-set -euo pipefail
-self="$(readlink -f "$0")"
-prefix_dir="$(dirname "$self")"
-launcher="${BYOND_LAUNCHER:-byond-launcher}"
-
-if [ "${1:-}" = "--register" ]; then
-  command -v xdg-mime >/dev/null || { echo "Error: xdg-mime not found." >&2; exit 0; }
-  apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-  # Prefer the single BYOND entry installed by install-byond.sh (it carries
-  # MimeType=x-scheme-handler/byond and Exec=... %u).
-  for cand in /usr/share/applications/byond.desktop "$apps/byond.desktop"; do
-    if [ -f "$cand" ]; then
-      mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}"
-      xdg-mime default byond.desktop x-scheme-handler/byond
-      echo "Registered byond.desktop as the byond url handler."
-      exit 0
-    fi
-  done
-  mkdir -p "$apps"
-  cat > "$apps/byond-url-handler.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=BYOND URL Handler
-Exec="$self" %u
-NoDisplay=true
-Terminal=false
-MimeType=x-scheme-handler/byond;
-EOF
-  command -v update-desktop-database >/dev/null && update-desktop-database "$apps" || true
-  xdg-mime default byond-url-handler.desktop x-scheme-handler/byond
-  echo "Registered $self as the byond url handler."
-  exit 0
-fi
-
-url="${1:-}"
-[ -n "$url" ] || { echo "usage: $0 <byond-url> | --register" >&2; exit 1; }
-export WINEPREFIX="${WINEPREFIX:-$prefix_dir}"
-export WINEDEBUG="${WINEDEBUG:--all}"
-
-in_prefix() { tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | grep -qxF "WINEPREFIX=$WINEPREFIX"; }
-find_pager() {
-  server_exe=""
-  local byond_pid pid
-  for byond_pid in $(pgrep -if 'byond\.exe'); do
-    in_prefix "$byond_pid" || continue
-    for pid in $(pgrep -x wineserver); do
-      if in_prefix "$pid"; then server_exe="$(readlink -f "/proc/$pid/exe")"; return 0; fi
-    done
-  done
-  return 1
-}
-
-if ! find_pager; then
-  if command -v "$launcher" >/dev/null 2>&1; then
-    setsid "$launcher" >/dev/null 2>&1 &
-  else
-    echo "BYOND is not running and launcher '$launcher' not found." >&2
-    exit 1
-  fi
-  for _ in $(seq 40); do sleep 2; find_pager && break; done
-  [ -n "${server_exe:-}" ] || { echo "Timed out waiting for BYOND to start." >&2; exit 1; }
-  sleep 5
-fi
-
-WINE="${WINE:-$(dirname "$server_exe")/wine}"
-location="Program Files (x86)"
-[ -d "$WINEPREFIX/drive_c/$location/BYOND" ] || location="Program Files"
-exec "$WINE" "C:\\$location\\BYOND\\bin\\byond.exe" -url "$url"
-HANDLER
-chmod +x "$PREFIX/space-handler.sh"
+download "$SPACE_HANDLER_URL" "$CACHE_DIR/space-handler.sh"
+place "$CACHE_DIR/space-handler.sh" "$PREFIX/space-handler.sh" 755 0
 bash "$PREFIX/space-handler.sh" --register || warn "URL handler registration failed (XDG?)"
+
+if [ "$SPACE_WATCHDOG_ENABLED" = "1" ]; then
+  download "$SPACE_WATCHDOG_URL" "$CACHE_DIR/space-watchdog.sh"
+  place "$CACHE_DIR/space-watchdog.sh" "$PREFIX/space-watchdog.sh" 755 0
+fi
 
 # ---------------------------------------------------------------------------
 # 11-13. Generate config, launcher and desktop entry
