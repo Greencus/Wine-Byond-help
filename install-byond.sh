@@ -34,6 +34,7 @@
 #   --d3d-extras-version VER D3D Extras release (default: v2)
 #   --renderer-limit N      WebView2 renderer process limit (default: 4)
 #   --no-font-patch         Skip merging hieroglyph/emoji/runic/math glyphs
+#   --no-watchdog           Disable Space Watchdog
 #   --math-font PATH        Math glyph source (Symbola.ttf recommended)
 #   --symbola-url URL         Symbola zip URL (fontlibrary.org by default)
 #   --repo-base URL         Base URL of your custom repo (raw github style)
@@ -58,6 +59,8 @@ SMOFONT_URL="${SMOFONT_URL:-${REPO_BASE}/extra/fonts/smalle.zip}"
 NTID_URL="${NTID_URL:-${REPO_BASE}/extra/NT-ID.sh}"
 SPACE_HANDLER_URL="${SPACE_HANDLER_URL:-${REPO_BASE}/extra/space-handler.sh}"
 FONT_PATCH_SCRIPT_URL="${FONT_PATCH_SCRIPT_URL:-${REPO_BASE}/extra/byond-font-patch.py}"
+# Used only when enabled; override while the watchdog asset is not upstream.
+SPACE_WATCHDOG_URL="${SPACE_WATCHDOG_URL:-${REPO_BASE}/extra/space-watchdog.sh}"
 # Glyph-source fonts for the WebView2 font patch (see byond-font-patch.py).
 EGYPT_URL="${EGYPT_URL:-https://raw.githubusercontent.com/google/fonts/main/ofl/notosansegyptianhieroglyphs/NotoSansEgyptianHieroglyphs-Regular.ttf}"
 RUNIC_URL="${RUNIC_URL:-https://raw.githubusercontent.com/google/fonts/main/ofl/notosansrunic/NotoSansRunic-Regular.ttf}"
@@ -65,6 +68,8 @@ EMOJI_URL="${EMOJI_URL:-https://raw.githubusercontent.com/google/fonts/main/ofl/
 SYMBOLA_URL="${SYMBOLA_URL:-https://fontlibrary.org/api/catalogue/symbola/download}"
 MATH_FONT="${MATH_FONT:-}"          # optional path to Symbola.ttf (preferred math source)
 FONT_PATCH="${FONT_PATCH:-1}"       # 1 = merge hieroglyph/emoji/runic/math glyphs
+# Keep the watchdog off until its script is merged upstream; then change this default to 1.
+SPACE_WATCHDOG_ENABLED="${SPACE_WATCHDOG_ENABLED:-0}"
 # Shared helper scripts are downloaded from REPO_BASE.
 
 # ---------------------------------------------------------------------------
@@ -458,6 +463,7 @@ while [ $# -gt 0 ]; do
     --d3d-extras-version) D3D_EXTRAS_VERSION="$2"; shift 2
                           D3D_EXTRAS_URL="https://github.com/lutris/d3d_extras/releases/download/${D3D_EXTRAS_VERSION}/${D3D_EXTRAS_VERSION}.tar.xz" ;;
     --no-font-patch)      FONT_PATCH=0; shift ;;
+    --no-watchdog)        SPACE_WATCHDOG_ENABLED=0; shift ;;
     --math-font)          MATH_FONT="$2"; shift 2 ;;
     --symbola-url)          SYMBOLA_URL="$2"; shift 2 ;;
     --renderer-limit)     WEBVIEW2_RENDERER_LIMIT="$2"; shift 2 ;;
@@ -465,7 +471,9 @@ while [ $# -gt 0 ]; do
                           SMOFONT_URL="${REPO_BASE}/extra/fonts/smalle.zip"
                           NTID_URL="${REPO_BASE}/extra/NT-ID.sh"
                           SPACE_HANDLER_URL="${REPO_BASE}/extra/space-handler.sh"
-                          FONT_PATCH_SCRIPT_URL="${REPO_BASE}/extra/byond-font-patch.py" ;;
+                          FONT_PATCH_SCRIPT_URL="${REPO_BASE}/extra/byond-font-patch.py"
+                          SPACE_WATCHDOG_URL="${REPO_BASE}/extra/space-watchdog.sh"
+                          ;;
     --user)               SYSTEM_INSTALL=0; shift ;;
     --system)             SYSTEM_INSTALL=1; shift ;;
     --yes)                ASSUME_YES=1; shift ;;
@@ -474,6 +482,11 @@ while [ $# -gt 0 ]; do
     *) die "unknown option: $1 (try --help)" ;;
   esac
 done
+
+case "$SPACE_WATCHDOG_ENABLED" in
+  0|1) ;;
+  *) die "SPACE_WATCHDOG_ENABLED must be 0 or 1" ;;
+esac
 
 if [ "$VKD3D_ENABLED" = "auto" ]; then
   VKD3D_ENABLED="$DXVK_ENABLED"
@@ -588,6 +601,9 @@ WINE_LARGE_ADDRESS_AWARE="1"
 # Extra arguments appended to the wine command.
 GAME_ARGS=""
 
+# Set to 1 to run the installed Space Watchdog with BYOND.
+SPACE_WATCHDOG_ENABLED="$SPACE_WATCHDOG_ENABLED"
+
 # NOTE: do not launch this through a child-subreaper (e.g. Lutris'
 # lutris-wrapper). Chromium/WebView2 hangs when wine is a subreaper.
 EOF
@@ -614,6 +630,21 @@ if [ -r "$USER_CONF" ]; then . "$USER_CONF"; conf_found=1; fi
 : "${WINE_BIN:=/usr/bin/wine}"
 : "${WINEPREFIX:?set WINEPREFIX in $SYSTEM_CONF}"
 : "${GAME_EXE:?set GAME_EXE in $SYSTEM_CONF}"
+
+case "${SPACE_WATCHDOG_ENABLED:-0}" in
+  0) ;;
+  1)
+    watchdog="$WINEPREFIX/space-watchdog.sh"
+    [ -x "$watchdog" ] || {
+      echo "byond-launcher: watchdog is enabled but missing or not executable: $watchdog" >&2
+      exit 1
+    }
+    ;;
+  *)
+    echo "byond-launcher: SPACE_WATCHDOG_ENABLED must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
 
 export WINEPREFIX
 [ -n "${WINEARCH:-}" ]            && export WINEARCH
@@ -655,6 +686,9 @@ if [ "${1:-}" = "-url" ] && [ -n "${2:-}" ]; then args+=(-url "$2"); fi
 cleanup_menu
 "$WINE_BIN" "$GAME_EXE" "${args[@]}" &
 game_pid=$!
+if [ "${SPACE_WATCHDOG_ENABLED:-0}" = "1" ]; then
+  WINE="$WINE_BIN" "$watchdog" --prefix "$WINEPREFIX" >>"$WINEPREFIX/space-watchdog.log" 2>&1 &
+fi
 trap 'kill -TERM "$game_pid" 2>/dev/null' INT TERM
 rc=0
 wait "$game_pid" || rc=$?
@@ -889,6 +923,11 @@ log "installing byond:// URL handler"
 download "$SPACE_HANDLER_URL" "$CACHE_DIR/space-handler.sh"
 place "$CACHE_DIR/space-handler.sh" "$PREFIX/space-handler.sh" 755 0
 bash "$PREFIX/space-handler.sh" --register || warn "URL handler registration failed (XDG?)"
+
+if [ "$SPACE_WATCHDOG_ENABLED" = "1" ]; then
+  download "$SPACE_WATCHDOG_URL" "$CACHE_DIR/space-watchdog.sh"
+  place "$CACHE_DIR/space-watchdog.sh" "$PREFIX/space-watchdog.sh" 755 0
+fi
 
 # ---------------------------------------------------------------------------
 # 11-13. Generate config, launcher and desktop entry
